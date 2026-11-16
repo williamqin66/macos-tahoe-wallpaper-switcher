@@ -1,0 +1,5 @@
+.DS_Store
+wallpaper-switch-config.json
+wallpaper-switch-state.json
+*.log
+Index.plist.last-good
