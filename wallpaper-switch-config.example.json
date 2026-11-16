@@ -1,0 +1,8 @@
+{
+  "city": "Example City",
+  "lat": 37.7749,
+  "lon": -122.4194,
+  "morningHoursAfterSunrise": 2.5,
+  "eveningHoursBeforeSunset": 1.5,
+  "eveningHoursAfterSunset": 0.5
+}
