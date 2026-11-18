@@ -1,0 +1,2848 @@
+#!/usr/bin/python3
+"""Safely inspect and update macOS aerial wallpaper choices (Tahoe, Golden Gate)."""
+
+import http.client
+import re
+import urllib.error
+import urllib.request
+import argparse
+import datetime as dt
+import math
+import subprocess
+from pathlib import Path
+import fcntl
+import json
+import os
+import plistlib
+import shutil
+import stat
+import sys
+import tempfile
+import threading
+import unicodedata
+
+
+AERIAL_PROVIDER = "com.apple.wallpaper.choice.aerials"
+
+# Held around short multi-step writes (plist write + verify/rollback, JSON
+# replace, pin relinking).  The dashboard runs writes on a daemon thread; on a
+# forced quit it takes this lock and keeps it, so the process never exits
+# half-way through such a step and the worker cannot start another one.
+WRITE_GUARD = threading.RLock()
+TARGET_KINDS = {"Desktop", "Idle"}
+PERIODS = ("morning", "day", "evening", "night")
+
+# Each series maps a solar period to Apple's manifest shotID (stable across
+# localizations) with the English accessibility label as a fallback.
+SERIES = {
+    "tahoe": {
+        "name": "Tahoe",
+        "morning": ("TA_L_001", "Tahoe Morning"),
+        "day": ("TA_L_002", "Tahoe Day"),
+        "evening": ("TA_D_001", "Tahoe Evening"),
+        "night": ("TA_D_002", "Tahoe Night"),
+    },
+    "goldenGate": {
+        "name": "Golden Gate",
+        "morning": ("GG_A_SUNSET", "Golden Gate Sunset"),
+        "day": ("GG_A_DAY", "Golden Gate Day"),
+        "evening": ("GG_A_EVENING", "Golden Gate Evening"),
+        "night": ("GG_A_NIGHT", "Golden Gate Night"),
+    },
+}
+
+
+def load_plist(path):
+    with open(path, "rb") as handle:
+        return plistlib.load(handle)
+
+
+def configuration_asset_id(choice):
+    configuration = choice.get("Configuration")
+    if not isinstance(configuration, (bytes, bytearray)):
+        return None
+
+    try:
+        decoded = plistlib.loads(bytes(configuration))
+    except (ValueError, TypeError, plistlib.InvalidFileException):
+        return None
+
+    if not isinstance(decoded, dict):
+        return None
+    asset_id = decoded.get("assetID")
+    return asset_id if isinstance(asset_id, str) else None
+
+
+def collect_target_choices(root):
+    """Collect Choices owned specifically by Desktop and Idle nodes."""
+    results = []
+    seen = set()
+
+    def walk(node, path=()):
+        if isinstance(node, dict):
+            for key, value in node.items():
+                key_string = str(key)
+                child_path = path + (key_string,)
+
+                if key_string in TARGET_KINDS and isinstance(value, dict):
+                    content = value.get("Content")
+                    choices = content.get("Choices") if isinstance(content, dict) else None
+                    if isinstance(choices, list):
+                        for index, choice in enumerate(choices):
+                            if isinstance(choice, dict) and id(choice) not in seen:
+                                seen.add(id(choice))
+                                results.append(
+                                    {
+                                        "kind": key_string,
+                                        "path": ".".join(child_path + ("Content", "Choices", str(index))),
+                                        "choice": choice,
+                                    }
+                                )
+
+                walk(value, child_path)
+        elif isinstance(node, list):
+            for index, value in enumerate(node):
+                walk(value, path + (str(index),))
+
+    walk(root)
+    # Recent macOS releases store the active wallpaper in Linked nodes under
+    # AllSpacesAndDisplays and SystemDefault instead of per-Desktop/Idle nodes.
+    # Fill whichever target kind is absent, preserving all other plist data.
+    if isinstance(root, dict):
+        has_desktop = any(item["kind"] == "Desktop" for item in results)
+        has_idle = any(item["kind"] == "Idle" for item in results)
+        fallback_owners = []
+        if not has_desktop:
+            fallback_owners.append("AllSpacesAndDisplays")
+        if not has_idle:
+            fallback_owners.append("SystemDefault")
+        for owner in fallback_owners:
+            owner_node = root.get(owner)
+            linked = owner_node.get("Linked") if isinstance(owner_node, dict) else None
+            content = linked.get("Content") if isinstance(linked, dict) else None
+            choices = content.get("Choices") if isinstance(content, dict) else None
+            if isinstance(choices, list):
+                for index, choice in enumerate(choices):
+                    if isinstance(choice, dict) and id(choice) not in seen:
+                        seen.add(id(choice))
+                        results.append({
+                            "kind": owner,
+                            "path": f"{owner}.Linked.Content.Choices.{index}",
+                            "choice": choice,
+                        })
+    return results
+
+
+def status_payload(plist_path, desired_asset_id):
+    data = load_plist(plist_path)
+    targets = collect_target_choices(data)
+    choices = [
+        {
+            "kind": target["kind"],
+            "path": target["path"],
+            "provider": target["choice"].get("Provider"),
+            "assetID": configuration_asset_id(target["choice"]),
+        }
+        for target in targets
+    ]
+    desktop_count = sum(choice["kind"] in ("Desktop", "AllSpacesAndDisplays") for choice in choices)
+    idle_count = sum(choice["kind"] in ("Idle", "SystemDefault") for choice in choices)
+    all_match = (
+        desktop_count > 0
+        and idle_count > 0
+        and all(choice["assetID"] == desired_asset_id and choice["provider"] == AERIAL_PROVIDER for choice in choices)
+    )
+    return {
+        "allMatch": all_match,
+        "desktopCount": desktop_count,
+        "idleCount": idle_count,
+        "choices": choices,
+    }
+
+
+def fsync_file(path):
+    with open(path, "rb") as handle:
+        os.fsync(handle.fileno())
+
+
+def atomic_copy(source, destination):
+    destination_directory = os.path.dirname(destination)
+    os.makedirs(destination_directory, exist_ok=True)
+    descriptor, temporary = tempfile.mkstemp(
+        prefix=os.path.basename(destination) + ".",
+        suffix=".tmp",
+        dir=destination_directory,
+    )
+    os.close(descriptor)
+    try:
+        shutil.copy2(source, temporary)
+        fsync_file(temporary)
+        os.replace(temporary, destination)
+    finally:
+        if os.path.exists(temporary):
+            os.unlink(temporary)
+
+
+def atomic_write_plist(path, data):
+    output = plistlib.dumps(data, fmt=plistlib.FMT_BINARY)
+    plistlib.loads(output)
+
+    directory = os.path.dirname(path)
+    descriptor, temporary = tempfile.mkstemp(
+        prefix=os.path.basename(path) + ".",
+        suffix=".tmp",
+        dir=directory,
+    )
+    try:
+        mode = stat.S_IMODE(os.stat(path).st_mode)
+        os.fchmod(descriptor, mode)
+        with os.fdopen(descriptor, "wb") as handle:
+            handle.write(output)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary, path)
+    finally:
+        if os.path.exists(temporary):
+            os.unlink(temporary)
+
+
+def apply_asset(plist_path, desired_asset_id, last_good_path):
+    lock_path = os.path.join(
+        os.path.dirname(plist_path),
+        ".tahoe-wallpaper-switcher.lock",
+    )
+
+    with open(lock_path, "a", encoding="utf-8") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        data = load_plist(plist_path)
+        targets = collect_target_choices(data)
+        desktop_count = sum(target["kind"] in ("Desktop", "AllSpacesAndDisplays") for target in targets)
+        idle_count = sum(target["kind"] in ("Idle", "SystemDefault") for target in targets)
+        if desktop_count == 0 or idle_count == 0:
+            raise RuntimeError(
+                "Expected at least one Desktop and one Idle Choice; "
+                f"found Desktop={desktop_count}, Idle={idle_count}"
+            )
+
+        if status_payload(plist_path, desired_asset_id)["allMatch"]:
+            return {"updated": 0, "assetID": desired_asset_id}
+
+        configuration = plistlib.dumps(
+            {"assetID": desired_asset_id},
+            fmt=plistlib.FMT_BINARY,
+        )
+        for target in targets:
+            target["choice"]["Provider"] = AERIAL_PROVIDER
+            target["choice"]["Configuration"] = configuration
+
+        with WRITE_GUARD:
+            atomic_copy(plist_path, last_good_path)
+            replaced = False
+            try:
+                atomic_write_plist(plist_path, data)
+                replaced = True
+                verification = status_payload(plist_path, desired_asset_id)
+                if not verification["allMatch"]:
+                    raise RuntimeError(
+                        "Post-write verification failed: "
+                        + json.dumps(verification, ensure_ascii=False)
+                    )
+            except Exception as error:
+                if replaced and os.path.isfile(last_good_path):
+                    atomic_copy(last_good_path, plist_path)
+                    raise RuntimeError(
+                        f"Update failed and last-good settings were restored: {error}"
+                    ) from error
+                raise
+
+        return {
+            "updated": len(targets),
+            "desktopCount": desktop_count,
+            "idleCount": idle_count,
+            "assetID": desired_asset_id,
+            "lastGood": last_good_path,
+        }
+
+
+def video_stat(path):
+    """Return a usable stat result for a non-empty regular file, else None."""
+    try:
+        info = os.stat(path)
+    except FileNotFoundError:
+        return None
+    return info if stat.S_ISREG(info.st_mode) and info.st_size > 0 else None
+
+
+def video_present(path):
+    """One stat call, so a CacheDelete purge mid-check counts as not downloaded."""
+    try:
+        info = os.stat(path)
+    except FileNotFoundError:
+        return False
+    return stat.S_ISREG(info.st_mode) and info.st_size > 0
+
+
+def series_payload(manifest_path, series_key, videos_dir):
+    if series_key not in SERIES:
+        raise ValueError(
+            f"Unknown series {series_key!r}; choose one of: {', '.join(SERIES)}"
+        )
+    with open(manifest_path, "r", encoding="utf-8") as handle:
+        manifest = json.load(handle)
+    assets = manifest.get("assets") if isinstance(manifest, dict) else None
+    if not isinstance(assets, list):
+        raise ValueError("Wallpaper manifest has no assets list")
+
+    series = SERIES[series_key]
+    ids = {}
+    missing = []
+    not_downloaded = []
+    for period in PERIODS:
+        shot_id, label = series[period]
+        match = next(
+            (a for a in assets if isinstance(a, dict) and a.get("shotID") == shot_id),
+            None,
+        ) or next(
+            (a for a in assets if isinstance(a, dict) and a.get("accessibilityLabel") == label),
+            None,
+        )
+        asset_id = match.get("id") if match else None
+        if not isinstance(asset_id, str) or not asset_id:
+            missing.append(label)
+            continue
+        ids[period] = asset_id
+        if videos_dir and not video_present(os.path.join(videos_dir, asset_id + ".mov")):
+            not_downloaded.append(label)
+
+    return {
+        "series": series_key,
+        "name": series["name"],
+        "ids": ids,
+        "missing": missing,
+        "notDownloaded": not_downloaded,
+    }
+
+
+DEFAULTS = {
+    "series": "tahoe", "city": "", "lat": 37.3349, "lon": -122.0090,
+    "morningHoursAfterSunrise": 2.5, "eveningHoursBeforeSunset": 1.5,
+    "eveningHoursAfterSunset": 0.5,
+}
+LABEL = "com.local.aerial-switch"
+OLD_LABELS = (
+    "com.user.wallpaper-switch-guard",
+    "com.user.wallpaper-switch",
+    "com.example.tahoe-wallpaper-switcher",
+)
+
+
+class Paths:
+    def __init__(self, home=None):
+        self.home = Path(home or os.environ.get("AERIAL_SWITCH_HOME") or Path.home())
+        self.support = self.home / "Library/Application Support/aerial-switch"
+        store = self.home / "Library/Application Support/com.apple.wallpaper"
+        self.plist = store / "Store/Index.plist"
+        self.manifest = store / "aerials/manifest/entries.json"
+        self.videos = store / "aerials/videos"
+        self.pinned = self.support / "pinned"
+        self.download_lock = self.support / "download.lock"
+        self.config = self.support / "config.json"
+        self.state = self.support / "state.json"
+        self.backup = self.support / "Index.plist.last-good"
+        self.legacy = self.home / "Library/Scripts/wallpaper-switch-config.json"
+        self.agent = self.home / "Library/LaunchAgents" / (LABEL + ".plist")
+        self.log = self.home / "Library/Logs/aerial-switch.log"
+
+
+def read_json(path):
+    with open(path, encoding="utf-8") as handle:
+        return json.load(handle)
+
+
+def write_json(path, value):
+    with WRITE_GUARD:
+        _write_json(path, value)
+
+
+def _write_json(path, value):
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, temp = tempfile.mkstemp(dir=str(path.parent))
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            json.dump(value, handle, ensure_ascii=False, indent=2, allow_nan=False)
+            handle.write("\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temp, path)
+    finally:
+        if os.path.exists(temp):
+            os.unlink(temp)
+
+
+def validate_config(raw):
+    if not isinstance(raw, dict):
+        raise ValueError("Config must be a JSON object")
+    cfg = dict(DEFAULTS, **raw)
+    if cfg["series"] not in SERIES:
+        raise ValueError("series must be tahoe or goldenGate")
+    if not isinstance(cfg["city"], str):
+        raise ValueError("city must be a string")
+    for key, low, high in [("lat", -90, 90), ("lon", -180, 180)] + [
+            (key, 0, 6) for key in DEFAULTS if key.endswith("Sunrise") or key.endswith("Sunset")]:
+        value = cfg[key]
+        if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value) or not low <= value <= high:
+            raise ValueError(f"{key} must be a finite number in [{low}, {high}]")
+    return cfg
+
+
+def load_config(paths, migrate=False):
+    source = paths.config if paths.config.exists() else paths.legacy
+    cfg = validate_config(read_json(source) if source.exists() else {})
+    if migrate and not paths.config.exists():
+        # Copy legacy bytes exactly; leave the user's original untouched.
+        if source.exists():
+            atomic_copy(str(source), str(paths.config))
+        else:
+            write_json(paths.config, cfg)
+    return cfg
+
+
+def clock(hours):
+    total = math.floor(hours * 60 + 0.5) % 1440
+    return f"{total // 60:02d}:{total % 60:02d}"
+
+
+def solar(now, lat, lon):
+    # Match the original JS elapsed-day calculation from local January 0,
+    # including the local UTC offset at that date.
+    january_zero = dt.datetime(now.year - 1, 12, 31).timestamp()
+    n = math.floor((now.timestamp() - january_zero) / 86400)
+    b = math.radians(360 / 365.0 * (n - 81))
+    decl = math.radians(23.45 * math.sin(b))
+    lat_r = math.radians(lat)
+    cos_ha = ((math.sin(math.radians(-0.8333)) - math.sin(lat_r) * math.sin(decl))
+              / (math.cos(lat_r) * math.cos(decl)))
+    ha = math.degrees(math.acos(max(-1, min(1, cos_ha)))) / 15
+    eot = (9.87 * math.sin(2*b) - 7.53 * math.cos(b) - 1.5 * math.sin(b)) / 60
+    tz = now.utcoffset().total_seconds() / 3600
+    return 12 - lon / 15 - eot - ha + tz, 12 - lon / 15 - eot + ha + tz, cos_ha
+
+
+def in_window(h, start, end):
+    return end > start and any(start <= x < end for x in (h - 24, h, h + 24))
+
+
+def period_at(h, sunrise, sunset, cos_ha, cfg):
+    morning_end = sunrise + cfg["morningHoursAfterSunrise"]
+    evening_start = max(morning_end, sunset - cfg["eveningHoursBeforeSunset"])
+    evening_end = sunset + cfg["eveningHoursAfterSunset"]
+    if cos_ha >= 1:
+        return "night"
+    if cos_ha <= -1:
+        return "day"
+    if in_window(h, sunrise, morning_end):
+        return "morning"
+    if in_window(h, evening_start, evening_end):
+        return "evening"
+    if in_window(h, morning_end, evening_start):
+        return "day"
+    return "night"
+
+
+def current_period(now, cfg):
+    rise, setting, cos_ha = solar(now, cfg["lat"], cfg["lon"])
+    return period_at(now.hour + now.minute / 60, rise, setting, cos_ha, cfg)
+
+
+def next_transition(now, cfg):
+    # Minute resolution matches the scheduler's period calculation; recompute
+    # solar times on each local date, including across DST and polar seasons.
+    previous = current_period(now, cfg)
+    base = now.timestamp() - now.second - now.microsecond / 1e6
+    for minute in range(1, 370 * 1440):
+        candidate = dt.datetime.fromtimestamp(base + minute * 60).astimezone()
+        if current_period(candidate, cfg) != previous:
+            return candidate.isoformat(timespec="minutes")
+    return None
+
+
+def run_command(args, check=True):
+    return subprocess.run(args, check=check, capture_output=True, text=True, timeout=30)
+
+
+def service_absent(result):
+    message = (result.stderr or "") + (result.stdout or "")
+    return any(text in message.lower() for text in
+               ("could not find service", "no such process"))
+
+
+def loaded(label):
+    result = run_command(["/bin/launchctl", "print", f"gui/{os.getuid()}/{label}"], check=False)
+    if result.returncode == 0:
+        return True
+    if service_absent(result):
+        return False
+    raise RuntimeError(f"Cannot inspect LaunchAgent {label}: {result.stderr or result.stdout}")
+
+
+def legacy_agents(paths):
+    return [{"label": label, "loaded": is_loaded, "plist": str(plist),
+             "plistExists": exists}
+            for label in OLD_LABELS
+            for plist in [paths.agent.parent / (label + ".plist")]
+            for is_loaded, exists in [(loaded(label), plist.exists())]
+            if is_loaded or exists]
+
+
+def legacy_warning(items):
+    return {"legacyAgents": items, "warning": "Legacy LaunchAgents found; run install --migrate"} if items else {"legacyAgents": []}
+
+
+def migrate_legacy(paths, items):
+    # OLD_LABELS puts the recovery guard first so it cannot restore the main job.
+    for label in OLD_LABELS:
+        if not loaded(label):
+            continue
+        result = run_command(["/bin/launchctl", "bootout", f"gui/{os.getuid()}/{label}"], check=False)
+        if result.returncode and not service_absent(result):
+            raise RuntimeError(f"Cannot stop legacy LaunchAgent {label}: {result.stderr or result.stdout}")
+        if loaded(label):
+            raise RuntimeError(f"Legacy LaunchAgent still loaded: {label}")
+    backup = None
+    files = []
+    for label in OLD_LABELS:
+        source = paths.agent.parent / (label + ".plist")
+        if source.exists():
+            if backup is None:
+                root = paths.support / "legacy-backup"
+                root.mkdir(parents=True, exist_ok=True)
+                backup = Path(tempfile.mkdtemp(prefix=dt.datetime.now().strftime("%Y%m%d-%H%M%S-"), dir=str(root)))
+            run_command(["/usr/bin/chflags", "nouchg", str(source)])
+            destination = backup / source.name
+            source.rename(destination)
+            files.append({"source": str(source), "backup": str(destination)})
+    return {"labels": [item["label"] for item in items], "files": files,
+            "backupDirectory": str(backup) if backup else None}
+
+
+def verify_legacy_stopped():
+    remaining = [label for label in OLD_LABELS if loaded(label)]
+    if remaining:
+        raise RuntimeError("Legacy LaunchAgents still loaded: " + ", ".join(remaining))
+
+
+def selected_series(paths, cfg, require_downloads=False):
+    info = series_payload(str(paths.manifest), cfg["series"], str(paths.videos))
+    if info["missing"] or (require_downloads and info["notDownloaded"]):
+        raise ValueError("Series unavailable: " + json.dumps(info, ensure_ascii=False))
+    return info
+
+
+def pin_path(paths, series, asset_id):
+    if not asset_id or Path(asset_id).name != asset_id or asset_id in (".", ".."):
+        raise ValueError("Invalid manifest asset ID")
+    return paths.pinned / series / (asset_id + ".mov")
+
+
+def device(path):
+    while not path.exists():
+        path = path.parent
+    return path.stat().st_dev
+
+
+def sync_pins(paths, info, dry_run=False):
+    actions, warnings = [], []
+    if device(paths.pinned) != device(paths.videos):
+        return {"actions": [], "warnings": ["Pin protection skipped: pinned and videos are on different devices"]}
+    for old in sorted(paths.pinned.iterdir()) if paths.pinned.exists() else []:
+        if old.name != info["series"]:
+            actions.append({"action": "removePins", "path": str(old)})
+            if not dry_run:
+                if old.is_dir() and not old.is_symlink():
+                    shutil.rmtree(old)
+                else:
+                    old.unlink()
+    for asset_id in info["ids"].values():
+        pin = pin_path(paths, info["series"], asset_id)
+        video = paths.videos / (asset_id + ".mov")
+        video_info, pin_info = video_stat(video), video_stat(pin)
+        present, pinned = video_info is not None, pin_info is not None
+        same = present and pinned and (video_info.st_dev, video_info.st_ino) == (pin_info.st_dev, pin_info.st_ino)
+        action = ("pin" if present and not pinned else "restore" if pinned and not present
+                  else "replacePin" if present and pinned and not same else None)
+        if not action:
+            continue
+        actions.append({"action": action, "assetID": asset_id})
+        if dry_run:
+            continue
+        WRITE_GUARD.acquire()
+        try:
+            pin.parent.mkdir(parents=True, exist_ok=True)
+            paths.videos.mkdir(parents=True, exist_ok=True)
+            if action == "restore":
+                # Replace an empty cache entry as well as an absent one.
+                if video.exists():
+                    video.unlink()
+                os.link(pin, video)
+            else:
+                fd, temporary = tempfile.mkstemp(prefix=".pin-", dir=str(pin.parent))
+                os.close(fd)
+                os.unlink(temporary)
+                try:
+                    os.link(video, temporary)
+                    os.replace(temporary, pin)
+                finally:
+                    if os.path.exists(temporary):
+                        os.unlink(temporary)
+        except OSError as error:
+            warnings.append(f"{action} {asset_id}: {error}")
+        finally:
+            WRITE_GUARD.release()
+    return {"actions": actions, "warnings": warnings}
+
+
+def download_busy(paths):
+    try:
+        handle = open(paths.download_lock, "rb")
+    except FileNotFoundError:
+        return False
+    with handle:
+        try:
+            fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            return True
+        return False
+
+
+def video_cache(paths, info):
+    videos = {}
+    for period, asset_id in info["ids"].items():
+        video = paths.videos / (asset_id + ".mov")
+        pin = pin_path(paths, info["series"], asset_id)
+        video_info, pin_info = video_stat(video), video_stat(pin)
+        present, pinned = video_info is not None, pin_info is not None
+        videos[period] = {"assetID": asset_id, "present": present, "pinned": pinned,
+                           "sameInode": present and pinned
+                           and (video_info.st_dev, video_info.st_ino) == (pin_info.st_dev, pin_info.st_ino)}
+    return videos
+
+
+def cache_status(paths, info):
+    videos, inodes = video_cache(paths, info), {}
+    if paths.pinned.exists():
+        for pin in paths.pinned.rglob("*.mov"):
+            try:
+                info_stat = pin.stat()
+                inodes[(info_stat.st_dev, info_stat.st_ino)] = info_stat.st_size
+            except FileNotFoundError:
+                pass
+    # Never include proxy endpoints, bypass lists, usernames or passwords.
+    schemes = sorted(key for key in urllib.request.getproxies() if key != "no")
+    return {"videos": videos, "pinnedBytes": sum(inodes.values()),
+            "downloadInProgress": download_busy(paths),
+            "proxy": {"detected": bool(schemes), "schemes": schemes}}
+
+
+class DownloadBusy(RuntimeError):
+    pass
+
+
+def download_url(paths, asset_id):
+    assets = read_json(paths.manifest)["assets"]
+    asset = next(item for item in assets if item.get("id") == asset_id)
+    preferred = asset.get("url-4K-SDR-240FPS")
+    if isinstance(preferred, str) and preferred.endswith(".mov"):
+        return preferred
+    for key in sorted(asset):
+        value = asset[key]
+        if key.startswith("url-") and isinstance(value, str) and value.endswith(".mov"):
+            return value
+    raise ValueError(f"No download URL for {asset_id}")
+
+
+def download_video(paths, series, asset_id):
+    pin_path(paths, series, asset_id)  # validate before constructing any paths
+    paths.support.mkdir(parents=True, exist_ok=True)
+    with open(paths.download_lock, "a") as lock:
+        try:
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError as error:
+            raise DownloadBusy("Another run is downloading; keeping current wallpaper") from error
+        video = paths.videos / (asset_id + ".mov")
+        if video_present(video):
+            return {"actions": [], "warnings": []}
+        url = download_url(paths, asset_id)
+        paths.videos.mkdir(parents=True, exist_ok=True)
+        part = paths.videos / ("." + asset_id + ".mov.part")
+        meta_path = paths.videos / ("." + asset_id + ".mov.part.json")
+        try:
+            meta = read_json(meta_path)
+        except (OSError, ValueError):
+            meta = None
+        offset = part.stat().st_size if part.exists() else 0
+        etag = meta.get("etag") if isinstance(meta, dict) else None
+        # Only resume a part that came from this exact URL with a strong ETag.
+        if offset and (not isinstance(meta, dict) or meta.get("url") != url
+                       or not isinstance(etag, str) or not etag or etag.startswith("W/")):
+            part.unlink(missing_ok=True)
+            offset = 0
+        if not offset:
+            meta_path.unlink(missing_ok=True)
+        headers = {"Range": f"bytes={offset}-", "If-Range": etag} if offset else {}
+        request = urllib.request.Request(url, headers=headers)
+        # urlopen's default ProxyHandler reads macOS system proxies under launchd.
+        try:
+            response = urllib.request.urlopen(request, timeout=60)
+        except urllib.error.HTTPError as error:
+            if error.code == 416:
+                part.unlink(missing_ok=True)
+            raise
+        with response:
+            length = response.headers.get("Content-Length")
+            if length is None or not length.isdigit():
+                part.unlink(missing_ok=True)
+                raise ValueError("Download has no valid Content-Length")
+            length = int(length)
+            total = length
+            append = response.status == 206
+            if append:
+                match = re.fullmatch(r"bytes (\d+)-(\d+)/(\d+)", response.headers.get("Content-Range", ""))
+                if not match or int(match[1]) != offset or int(match[2]) + 1 != int(match[3]) or int(match[2]) - offset + 1 != length:
+                    part.unlink(missing_ok=True)
+                    raise ValueError("Invalid download Content-Range")
+                total = int(match[3])
+                if response.headers.get("ETag") != etag:
+                    part.unlink(missing_ok=True)
+                    meta_path.unlink(missing_ok=True)
+                    raise ValueError("Download changed on server; restarting next run")
+            elif response.status != 200:
+                raise ValueError(f"Unexpected download status {response.status}")
+            else:
+                # Fresh body (no resume, or If-Range said the file changed).
+                write_json(meta_path, {"url": url, "etag": response.headers.get("ETag", "")})
+            try:
+                with open(part, "ab" if append else "wb") as output:
+                    os.chmod(part, 0o600)
+                    while True:
+                        chunk = response.read(1024 * 1024)
+                        if not chunk:
+                            break
+                        output.write(chunk)
+            except http.client.IncompleteRead as error:
+                part.unlink(missing_ok=True)
+                raise ValueError("Download length mismatch") from error
+            if part.stat().st_size != total or total == 0:
+                part.unlink(missing_ok=True)
+                meta_path.unlink(missing_ok=True)
+                raise ValueError("Download length mismatch")
+            run_command(["/usr/bin/xattr", "-w", "SourceURL", url, str(part)])
+            run_command(["/usr/bin/xattr", "-w", "LastETag", response.headers.get("ETag", ""), str(part)])
+        part.chmod(0o600)
+        os.replace(part, video)
+        meta_path.unlink(missing_ok=True)
+        # Fix 2: report whether the new video is actually protected.
+        return sync_pins(paths, {"series": series, "ids": {"download": asset_id}})
+
+
+def apply_cache(paths, cfg, result, dry_run):
+    info = selected_series(paths, cfg)
+    sync = sync_pins(paths, info, dry_run)
+    result.update(pinActions=sync["actions"], warnings=sync["warnings"], updated=0)
+    desired = result["desiredID"]
+    video = paths.videos / (desired + ".mov")
+    can_restore = any(item.get("assetID") == desired and item["action"] == "restore" for item in sync["actions"])
+    result["ready"] = video_present(video) or (dry_run and can_restore)
+    result["plannedActions"] = list(sync["actions"])
+    if not result["ready"]:
+        result["plannedActions"].append({"action": "download", "assetID": desired})
+        if not dry_run:
+            try:
+                pinned = download_video(paths, cfg["series"], desired)
+                result["warnings"].extend("Downloaded but not protected: " + w for w in pinned["warnings"])
+                result["ready"] = True
+            except Exception as error:
+                result["warnings"].append(f"Current video unavailable: {type(error).__name__}")
+                result["downloadError"] = type(error).__name__ + (": " + str(error) if isinstance(error, (ValueError, DownloadBusy)) else ": download failed; retry next run")
+                result["wouldUpdate"] = False
+                return
+    result["wouldUpdate"] = result["ready"] and not result["plist"]["allMatch"]
+    if not result["plist"]["allMatch"]:
+        result["plannedActions"].append({"action": "switch", "assetID": desired, "afterVideoReady": True})
+    if not dry_run:
+        load_config(paths, migrate=True)
+        update = apply_asset(str(paths.plist), desired, str(paths.backup))
+        if update["updated"]:
+            run_command(["/usr/bin/killall", "WallpaperAgent"], check=False)
+        state = {key: result[key] for key in ("series", "period", "desiredID")}
+        try:
+            old_state = read_json(paths.state)
+        except (OSError, ValueError):
+            old_state = None
+        if old_state != state:
+            write_json(paths.state, state)
+        result["updated"] = update["updated"]
+        now = dt.datetime.now().astimezone()
+        result["log"] = f'{clock(now.hour + now.minute / 60)} | {cfg["city"]} | {result["period"]} | {result["sunrise"]}↑ {result["sunset"]}↓'
+    transition = result["nextSwitch"]
+    if transition:
+        when = dt.datetime.fromisoformat(transition)
+        if 0 <= (when - dt.datetime.now().astimezone()).total_seconds() <= 45 * 60:
+            next_id = info["ids"][current_period(when, cfg)]
+            next_video = paths.videos / (next_id + ".mov")
+            if not video_present(next_video):
+                restored = dry_run and any(item.get("assetID") == next_id and item["action"] == "restore" for item in sync["actions"])
+                if not restored:
+                    result["plannedActions"].append({"action": "prefetch", "assetID": next_id})
+                    if not dry_run:
+                        try:
+                            pinned = download_video(paths, cfg["series"], next_id)
+                            result["warnings"].extend("Prefetched but not protected: " + w for w in pinned["warnings"])
+                        except Exception as error:
+                            result["warnings"].append(f"Prefetch failed: {type(error).__name__}; retry next run")
+
+
+def snapshot(paths, cfg):
+    now = dt.datetime.now().astimezone()
+    rise, setting, cos_ha = solar(now, cfg["lat"], cfg["lon"])
+    period = current_period(now, cfg)
+    info = selected_series(paths, cfg, require_downloads=False)
+    desired = info["ids"][period]
+    return {"series": cfg["series"], "city": cfg["city"], "period": period,
+            "sunrise": clock(rise) if -1 < cos_ha < 1 else None,
+            "sunset": clock(setting) if -1 < cos_ha < 1 else None,
+            "solarCondition": "polar night" if cos_ha >= 1 else "polar day" if cos_ha <= -1 else "normal",
+            "nextSwitch": next_transition(now, cfg), "desiredID": desired,
+            "plist": status_payload(str(paths.plist), desired),
+            "launchAgentLoaded": loaded(LABEL), "notDownloaded": info["notDownloaded"],
+            **legacy_warning(legacy_agents(paths)), **cache_status(paths, info)}
+
+
+def install(paths, prefix, migrate):
+    cfg = load_config(paths)
+    selected_series(paths, cfg)
+    # Resolve before touching launchd: launchd does not keep the caller's
+    # working directory, so ProgramArguments must be absolute.
+    destination = (Path(prefix).expanduser().resolve() / "bin/aerial-switch"
+                   if prefix else paths.home / ".local/bin/aerial-switch")
+    legacy = legacy_agents(paths)
+    if legacy and not migrate:
+        raise ValueError("Legacy LaunchAgents found; re-run install --migrate: "
+                         + json.dumps(legacy, ensure_ascii=False))
+    migration = migrate_legacy(paths, legacy) if migrate else None
+    verify_legacy_stopped()
+    load_config(paths, migrate=True)
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    if Path(__file__).resolve() != destination.resolve():
+        atomic_copy(str(Path(__file__).resolve()), str(destination))
+    destination.chmod(0o755)
+    paths.agent.parent.mkdir(parents=True, exist_ok=True)
+    paths.log.parent.mkdir(parents=True, exist_ok=True)
+    agent = {"Label": LABEL, "ProgramArguments": [str(destination), "apply"],
+             "RunAtLoad": True, "StartInterval": 900,
+             "StandardOutPath": str(paths.log), "StandardErrorPath": str(paths.log)}
+    # Preserve an injected home in isolated installations as well.
+    if os.environ.get("AERIAL_SWITCH_HOME"):
+        agent["EnvironmentVariables"] = {"AERIAL_SWITCH_HOME": str(paths.home)}
+    if loaded(LABEL):
+        run_command(["/bin/launchctl", "bootout", f"gui/{os.getuid()}/{LABEL}"])
+    if not paths.agent.exists():
+        paths.agent.touch(mode=0o600)
+    atomic_write_plist(str(paths.agent), agent)
+    verify_legacy_stopped()
+    run_command(["/bin/launchctl", "bootstrap", f"gui/{os.getuid()}", str(paths.agent)])
+    return {"installed": str(destination), "launchAgent": str(paths.agent),
+            "migration": migration}
+
+
+def validated_backup_bytes(backup_path):
+    """Read the backup once and check it is a usable wallpaper plist."""
+    if not backup_path.is_file():
+        raise ValueError(f"Backup does not exist: {backup_path}")
+    raw = backup_path.read_bytes()
+    try:
+        data = plistlib.loads(raw)
+    except (ValueError, TypeError, plistlib.InvalidFileException) as error:
+        raise ValueError(f"Backup is not a valid plist: {error}") from error
+    kinds = {target["kind"] for target in collect_target_choices(data)}
+    if not kinds.intersection({"Desktop", "AllSpacesAndDisplays"}) or not kinds.intersection({"Idle", "SystemDefault"}):
+        raise ValueError("Backup has no Desktop/Idle targets")
+    return raw
+
+
+def atomic_write_bytes(path, raw):
+    directory = os.path.dirname(path)
+    descriptor, temporary = tempfile.mkstemp(
+        prefix=os.path.basename(path) + ".", suffix=".tmp", dir=directory,
+    )
+    try:
+        if os.path.exists(path):
+            os.fchmod(descriptor, stat.S_IMODE(os.stat(path).st_mode))
+        with os.fdopen(descriptor, "wb") as handle:
+            handle.write(raw)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary, path)
+    finally:
+        if os.path.exists(temporary):
+            os.unlink(temporary)
+
+
+def restore_backup(plist_path, backup_path):
+    """Restore one fixed backup snapshot under the apply lock.
+
+    The backup is re-read and validated while holding the lock so a concurrent
+    apply cannot swap it between validation and copy. If verification fails,
+    the pre-restore plist is put back.
+    """
+    lock_path = plist_path.parent / ".tahoe-wallpaper-switcher.lock"
+    with open(lock_path, "a", encoding="utf-8") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        raw = validated_backup_bytes(backup_path)
+        before = plist_path.read_bytes()
+        atomic_write_bytes(str(plist_path), raw)
+        if plist_path.read_bytes() != raw:
+            atomic_write_bytes(str(plist_path), before)
+            raise RuntimeError("Restore verification failed; previous settings were put back")
+
+
+def uninstall(paths, restore):
+    if restore:
+        validated_backup_bytes(paths.backup)  # fail early, before touching launchd
+    if loaded(LABEL):
+        run_command(["/bin/launchctl", "bootout", f"gui/{os.getuid()}/{LABEL}"])
+    if paths.agent.exists():
+        paths.agent.unlink()
+    if restore:
+        restore_backup(paths.plist, paths.backup)
+        run_command(["/usr/bin/killall", "WallpaperAgent"], check=False)
+    if paths.pinned.exists():
+        shutil.rmtree(paths.pinned)
+    return {"removedPins": str(paths.pinned), "uninstalled": True, "restored": restore, "kept": "executable, config, state, backup and legacy files"}
+
+
+def doctor(paths):
+    checks = {}
+    def check(name, operation):
+        try:
+            checks[name] = {"ok": True, "detail": operation()}
+        except Exception as error:
+            checks[name] = {"ok": False, "error": str(error)}
+    def python_check():
+        if not os.access("/usr/bin/python3", os.X_OK):
+            raise ValueError("/usr/bin/python3 is not executable")
+        return run_command(["/usr/bin/python3", "--version"]).stdout.strip()
+    def plist_check():
+        result = status_payload(str(paths.plist), "")
+        if not result["desktopCount"] or not result["idleCount"]:
+            raise ValueError("No Desktop/Idle targets")
+        return result
+    check("python", python_check)
+    check("config", lambda: load_config(paths))
+    check("manifest", lambda: {key: series_payload(str(paths.manifest), key, str(paths.videos)) for key in SERIES})
+    check("plist", plist_check)
+    check("selectedVideos", lambda: selected_series(paths, load_config(paths)))
+    check("cache", lambda: cache_status(paths, selected_series(paths, load_config(paths))))
+    check("launchAgent", lambda: {"loaded": loaded(LABEL), **legacy_warning(legacy_agents(paths))})
+    if checks["selectedVideos"]["ok"] and checks["selectedVideos"]["detail"]["notDownloaded"]:
+        checks["selectedVideos"]["warning"] = "notDownloaded: apply will restore or download the current video before switching"
+    return checks
+
+
+def save_series(paths, name):
+    cfg = load_config(paths)
+    cfg["series"] = name
+    info = selected_series(paths, cfg)
+    cfg = validate_config(cfg)
+    write_json(paths.config, cfg)
+    return dict(cfg, notDownloaded=info["notDownloaded"], protection=sync_pins(paths, info),
+                message="Series saved; run apply to switch. No downloads performed.")
+
+
+def save_config_values(paths, **values):
+    cfg = load_config(paths)
+    cfg.update(values)
+    cfg = validate_config(cfg)
+    write_json(paths.config, cfg)
+    return cfg
+
+
+def save_location(paths, lat, lon, city):
+    return save_config_values(paths, lat=lat, lon=lon, city=city)
+
+
+def apply_command(paths, dry_run):
+    cfg = load_config(paths)
+    result = snapshot(paths, cfg)
+    apply_cache(paths, cfg, result, dry_run)
+    return cfg, result
+
+
+def after_apply(paths, cfg, result, dry_run):
+    """For display only: a copy of an apply result whose video, pin and plist
+    fields are re-read after the run (the result itself, printed as JSON,
+    keeps the pre-run snapshot)."""
+    if dry_run:
+        return result
+    shown = dict(result)
+    try:
+        info = selected_series(paths, cfg)
+        shown.update(cache_status(paths, info), notDownloaded=info["notDownloaded"],
+                     plist=status_payload(str(paths.plist), result["desiredID"]))
+    except Exception:  # keep the pre-run figures rather than fail after a successful apply
+        pass
+    return shown
+
+
+def series_videos(paths, payload):
+    """Per-series present/pinned/sameInode, as status reports for the current series."""
+    videos = {}
+    for key, info in payload.items():
+        try:
+            videos[key] = video_cache(paths, info)
+        except (OSError, ValueError):
+            pass
+    return videos
+
+
+# ===========================================================================
+# Human-readable output and the interactive dashboard.
+#
+# Rendering is pure: functions take snapshot/config dicts, a datetime and a
+# width, and return lines, each a list of (text, style) spans.  The ANSI
+# writer and the curses loop only paint those spans; JSON output is untouched.
+
+PERIOD_NAMES = {"morning": "早晨", "day": "白天", "evening": "傍晚", "night": "夜晚"}
+SERIES_ORDER = ("goldenGate", "tahoe")
+INDENT = 2
+
+GLYPHS = {
+    "unicode": {
+        "rule": "─", "marker": "▲", "dot": "·", "ok": "✓", "fail": "✗", "warn": "!",
+        "unpinned": "○", "restorable": "↺", "missing": "↓", "downloading": "⋯",
+        "ellipsis": "…", "current": "●", "other": "○", "pointer": "▸", "caret": "▏",
+        "deg": "°", "times": "×", "lr": "←→", "ud": "↑↓", "left": "‹", "right": "›",
+        "spinner": "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏",
+        "bar": {"night": "░", "morning": "▒", "day": "█", "evening": "▓"},
+    },
+    "ascii": {
+        "rule": "-", "marker": "^", "dot": "-", "ok": "+", "fail": "x", "warn": "!",
+        "unpinned": "o", "restorable": "r", "missing": "v", "downloading": "~",
+        "ellipsis": "...", "current": "*", "other": "o", "pointer": ">", "caret": "_",
+        "deg": "", "times": "x", "lr": "<>", "ud": "^v", "left": "<", "right": ">",
+        "spinner": "|/-\\",
+        "bar": {"night": ".", "morning": "-", "day": "#", "evening": "="},
+    },
+}
+
+# Style name -> (256-colour index, 8-colour index).  Muted tones keep the
+# dashboard quiet; period colours echo dawn gold, sky, dusk and night blue.
+COLORS = {
+    "series": (180, 3), "accent": (180, 3), "ok": (108, 2), "warn": (179, 3),
+    "err": (167, 1), "morning": (179, 3), "day": (110, 6), "evening": (173, 5),
+    "night": (67, 4), "dim": (245, None), "label": (245, None),
+}
+ATTRS = {
+    "title": "bold", "strong": "bold", "key": "bold", "marker": "bold", "series": "bold",
+    "dim": "dim", "label": "dim", "sel": "reverse", "field": "underline",
+    "field_active": "reverse",
+}
+ANSI_ATTRS = {"bold": "1", "dim": "2", "reverse": "7", "underline": "4"}
+
+# English fallback for terminals whose encoding cannot show Chinese.
+EN = {
+    "早晨": "Morning", "白天": "Day", "傍晚": "Evening", "夜晚": "Night",
+    "极昼": "Polar day", "极夜": "Polar night", " · 全天白天": " - day all day",
+    " · 全天夜晚": " - night all day", "现在": "now", "明天": "tomorrow",
+    "{m}月{d}日": "{m}/{d}", "即将切换": "switching now",
+    "{m} 分 {s:02d} 秒后": "in {m}m {s:02d}s", "{h} 小时 {m:02d} 分后": "in {h}h {m:02d}m",
+    "{d} 天 {h} 小时后": "in {d}d {h}h", "约 {m} 分钟后": "in ~{m} min",
+    "约 {h} 小时后": "in ~{h} h", "约 {h} 小时 {m} 分钟后": "in ~{h} h {m} min",
+    "约 {d} 天后": "in ~{d} days", "（{c}）": " ({c})",
+    "当前": "Now", "下一张": "Next", "视频": "Videos", "定时": "Schedule", "注意": "Note",
+    "位置": "Location", "时段": "Periods", "系列": "Series", "预演": "Dry run",
+    "本次": "Result", "程序": "Program", "日志": "Log", "迁移": "Migrated",
+    "切换": "Switch", "已移除": "Removed", "已恢复": "Restored", "已保留": "Kept",
+    "保护": "Pins", "状态": "Status",
+    "已应用": "applied", "待切换": "pending", "极昼或极夜期间不切换": "no switch during polar day/night",
+    "已保护 {size}": "pinned {size}", "未保护": "not pinned", "可从保护恢复": "restorable",
+    "下载中": "downloading", "缺失，应用时下载": "missing, downloaded on apply",
+    "运行中 · 每 15 分钟检查": "running, checks every 15 min",
+    "未运行 · 运行 aerial-switch install 启用": "not running; enable with aerial-switch install",
+    "发现旧版定时任务 {labels}；运行 aerial-switch install --migrate 迁移":
+        "legacy LaunchAgents {labels}; run aerial-switch install --migrate",
+    "{names} 视频尚未受硬链接保护，下次检查时补上":
+        "{names} not hard-link protected yet; fixed on next check",
+    "视频与保护目录不在同一磁盘，已跳过硬链接保护":
+        "videos and pins are on different disks; protection skipped",
+    "当前时段视频暂不可用（{0}），保持原壁纸，下次检查重试":
+        "current video unavailable ({0}); wallpaper kept, retrying next check",
+    "预取下一张失败（{0}），下次检查重试": "prefetch failed ({0}); retrying next check",
+    "已下载但未受保护：{0}": "downloaded but not protected: {0}",
+    "已预取但未受保护：{0}": "prefetched but not protected: {0}",
+    "硬链接保护失败（{0}）：{1}": "protection failed ({0}): {1}",
+    "另一个检查正在下载视频，保持原壁纸": "another check is downloading; wallpaper kept",
+    "下载失败：{0}": "download failed: {0}",
+    "保护{p}视频": "pin {p}", "恢复{p}视频": "restore {p}", "更新{p}视频的保护": "re-pin {p}",
+    "下载{p}视频": "download {p}", "预取{p}视频": "prefetch {p}",
+    "移除其他系列的保护": "unpin other series", "切换壁纸": "switch wallpaper",
+    "将：{0}": "would: {0}", "无需任何操作": "nothing to do",
+    "未切换：视频下载失败，保持原壁纸": "not switched: download failed, wallpaper kept",
+    "已切换到{p}壁纸": "switched to {p}", "壁纸已是最新，无需切换": "already up to date",
+    "已应用 {name}": "applied {name}",
+    "未下载，应用时自动下载": "not downloaded; fetched on apply",
+    "素材清单中缺失": "missing from manifest",
+    "用 aerial-switch series goldenGate 或 tahoe 选择": "choose with aerial-switch series goldenGate|tahoe",
+    "已选择 {name}": "selected {name}",
+    "下次检查时生效（最多 15 分钟），或运行 aerial-switch apply 立即应用":
+        "takes effect at the next check (within 15 min), or run aerial-switch apply",
+    "新增保护 {n} 个视频": "pinned {n} videos", "无变化": "unchanged",
+    "位置已保存": "location saved", "下次检查时按新位置切换": "used from the next check",
+    "安装": "Install", "已安装并启动定时任务": "installed and started",
+    "com.local.aerial-switch · 每 15 分钟检查": "com.local.aerial-switch, every 15 min",
+    "已停用 {n} 个旧版任务": "stopped {n} legacy jobs", "备份于 {0}": "backup in {0}",
+    "卸载": "Uninstall", "已卸载定时任务": "LaunchAgent removed",
+    "硬链接保护目录": "hard-link pins", "上次的壁纸设置": "last-good wallpaper settings",
+    "程序、配置、状态与备份": "program, config, state and backups",
+    "自检": "Doctor", "配置": "Config", "素材清单": "Manifest", "壁纸设置": "Wallpaper store",
+    "当前系列视频": "Series videos", "视频缓存": "Video cache", "定时任务": "LaunchAgent",
+    "{name} 缺少 {n} 个": "{name} missing {n}", "{names} 均已找到": "{names} found",
+    "{name} {n} 个未下载": "{name}: {n} not downloaded",
+    "桌面 {d} · 待机 {i}": "desktop {d}, idle {i}",
+    "{n} 个未下载（{names}），应用时会自动恢复或下载":
+        "{n} not downloaded ({names}); restored or downloaded on apply",
+    "{n} 个视频均已下载": "all {n} videos downloaded", "{a}/{b} 已保护": "{a}/{b} pinned",
+    "正在下载": "downloading", "系统代理 {s}": "proxy {s}", "无系统代理": "no proxy",
+    "运行中": "running", "发现旧版任务，运行 install --migrate 迁移": "legacy jobs found; run install --migrate",
+    "全部正常": "all good", "{n} 项失败": "{n} failed", "{n} 项需要注意": "{n} need attention",
+    "帮助": "Help", "按键": "Keys", "说明": "Notes",
+    "在 Golden Gate 与 Tahoe 之间选择": "choose Golden Gate or Tahoe",
+    "切换到所选系列，下次检查时生效": "select the series; takes effect at the next check",
+    "立即应用当前时段壁纸（会先确认）": "apply the current wallpaper now (asks first)",
+    "修改位置：纬度、经度、城市": "edit latitude, longitude and city",
+    "调整早晨与傍晚时段（0–6 小时，步进 0.5）": "adjust morning/evening (0-6 h, 0.5 steps)",
+    "运行自检": "run checks", "立即重新读取状态": "reload status now", "显示本帮助": "show this help",
+    "退出": "quit",
+    "状态每 30 秒自动刷新，时间与倒计时每秒更新。": "Status reloads every 30 s; clock and countdown every second.",
+    "定时任务每 15 分钟检查一次并按时段切换壁纸。": "The LaunchAgent checks every 15 minutes.",
+    "卸载等操作请在命令行运行 aerial-switch uninstall。": "Uninstall from the command line: aerial-switch uninstall.",
+    "纬度": "Lat", "经度": "Lon", "城市": "City", "可留空": "optional",
+    "早晨时长": "Morning", "傍晚提前": "Eve before", "傍晚延后": "Eve after",
+    "日出后": "after sunrise", "日落前开始": "before sunset", "日落后结束": "after sunset",
+    "{v} 小时": "{v} h",
+    "早晨 {m} 小时 · 傍晚自日落前 {b} 至日落后 {a} 小时":
+        "morning {m} h, evening {b} h before to {a} h after sunset",
+    "当前系列": "current series", " · 视频均已就绪": ", videos ready",
+    " · {n} 个视频待下载": ", {n} videos to download",
+    "Enter 切换到 {name}": "Enter selects {name}",
+    " · {n} 个视频待下载，应用时自动下载": ", {n} videos fetched on apply",
+    "{name} 在素材清单中缺少 {n} 个视频，无法选择": "{name} lacks {n} manifest videos",
+    "立即应用 {p} · {name}？": "Apply {p} - {name} now?",
+    "Y 确认   N 取消": "Y confirm   N cancel",
+    "系列切换": "series", "确认": "confirm", "取消": "cancel", "应用": "apply", "下一项": "next",
+    "保存": "save", "选择": "select", "调整 0.5 小时": "adjust 0.5 h", "重新自检": "re-run",
+    "返回": "back",
+    "终端窗口太小": "Terminal too small", "当前 {w}{x}{h}，至少需要 {mw}{x}{mh}": "now {w}{x}{h}, need {mw}{x}{mh}",
+    "按 Q 退出": "press Q to quit", "窗口高度不足，部分内容未显示": "window too short; some lines hidden",
+    "读取配置失败：{0}": "cannot read config: {0}", "读取素材清单失败：{0}": "cannot read manifest: {0}",
+    "读取状态失败：{0}": "cannot read status: {0}",
+    "状态读取失败，无法应用；按 D 查看自检": "status unavailable; press D for checks",
+    "配置读取失败，按 R 重试": "config unavailable; press R to retry",
+    "{name} 已是当前系列": "{name} is already selected",
+    "正在切换到 {name}…": "switching to {name}...",
+    "已切换到 {name} · 下次检查时生效，或按 A 立即应用": "selected {name}; next check applies it, or press A",
+    "（{n} 个视频待下载）": " ({n} videos to download)",
+    "操作失败：{0}": "failed: {0}", "已取消": "cancelled", "已刷新": "reloaded",
+    "正在应用…（如需下载视频可能要等一会儿）": "applying... (downloads may take a while)",
+    "已取消，位置未修改": "cancelled; location unchanged",
+    "纬度和经度只能输入数字": "latitude and longitude take numbers only",
+    "{label}需在 {low} 到 {high} 之间": "{label} must be between {low} and {high}",
+    "正在保存位置…": "saving location...", "位置已保存 · 下次检查时按新位置切换": "location saved; used from the next check",
+    "已取消，时段未修改": "cancelled; periods unchanged", "正在保存时段…": "saving periods...",
+    "时段已保存 · 下次检查时生效": "periods saved; used from the next check",
+    "正在自检…": "running checks...", "正在读取状态…": "reading status...",
+    "未选中的系列不受保护，系统可能清理": "unselected series are not pinned; macOS may purge them",
+    "按 Esc 取消编辑": "press Esc to cancel editing",
+    "窗口太小，编辑框未显示：请放大窗口，或按 Esc 取消": "window too small to show the editor; enlarge it or press Esc",
+    "操作": "operation", "切换系列": "series switch", "保存位置": "location save", "保存时段": "period save",
+    "{name}进行中，完成后再操作": "{name} in progress; wait for it to finish",
+    "{name}进行中 · 再按一次 Q 强制退出（下载下次续传）": "{name} in progress; Q again force-quits (downloads resume later)",
+    "正在写入壁纸设置，完成后自动退出…": "writing wallpaper settings; quitting when done...",
+    "{s} 秒": "{s}s",
+    "应用等操作在后台进行，期间可浏览；连按两次 Q 强制退出，未完成的下载下次续传。":
+        "Writes run in the background; press Q twice to force-quit (downloads resume next run).",
+}
+
+
+class Style:
+    """Output capabilities: colour, Unicode glyphs and Chinese text."""
+
+    def __init__(self, color=False, ascii=False, english=False, palette=8):
+        self.color, self.ascii, self.english, self.palette = color, ascii, english, palette
+        self.glyphs = GLYPHS["ascii" if ascii else "unicode"]
+        self.lw = 11 if english else 7  # label column: "下一张 " is 7 columns
+
+    @classmethod
+    def for_encoding(cls, encoding, tty=True, environ=None):
+        import codecs
+        environ = os.environ if environ is None else environ
+        try:
+            utf8 = codecs.lookup(encoding or "ascii").name == "utf-8"
+        except LookupError:
+            utf8 = False
+        try:
+            "早晨傍晚现在".encode(encoding or "ascii")
+            chinese = True
+        except (LookupError, UnicodeError):
+            chinese = False
+        term = environ.get("TERM", "")
+        color = bool(tty and not environ.get("NO_COLOR") and term != "dumb")
+        palette = 256 if "256color" in term or environ.get("COLORTERM") else 8
+        return cls(color=color, ascii=not utf8, english=not chinese, palette=palette)
+
+    @classmethod
+    def for_stream(cls, stream, environ=None):
+        try:
+            tty = stream.isatty()
+        except (AttributeError, ValueError):
+            tty = False
+        return cls.for_encoding(getattr(stream, "encoding", None), tty, environ)
+
+    def g(self, name):
+        return self.glyphs[name]
+
+    def bar(self, period):
+        return self.glyphs["bar"][period]
+
+    def t(self, text, **values):
+        if self.english:
+            text = EN.get(text, text)
+        return text.format(**values) if values else text
+
+    def join(self, items):
+        return (", " if self.english else "、").join(items)
+
+    def ansi(self, name):
+        codes = []
+        attr = ATTRS.get(name)
+        color = COLORS.get(name)
+        if color and self.palette == 256 and color[0] is not None:
+            codes.append(f"38;5;{color[0]}")
+            if attr == "dim":
+                attr = None
+        elif color and color[1] is not None:
+            codes.append(f"3{color[1]}")
+        if attr:
+            codes.insert(0, ANSI_ATTRS[attr])
+        return ";".join(codes)
+
+
+def char_width(ch):
+    if unicodedata.combining(ch) or ch in "​‍":
+        return 0
+    return 2 if unicodedata.east_asian_width(ch) in ("W", "F") else 1
+
+
+def dwidth(text):
+    return sum(char_width(ch) for ch in text)
+
+
+def clip(text, width, ellipsis=""):
+    if dwidth(text) <= width:
+        return text
+    limit = width - dwidth(ellipsis)
+    if limit < 0:
+        return clip(ellipsis, width)
+    out, used = [], 0
+    for ch in text:
+        size = char_width(ch)
+        if used + size > limit:
+            break
+        out.append(ch)
+        used += size
+    return "".join(out) + ellipsis
+
+
+def pad(text, width):
+    return text + " " * max(0, width - dwidth(text))
+
+
+def line_width(line):
+    return sum(dwidth(text) for text, _ in line)
+
+
+def plain(line):
+    return "".join(text for text, _ in line)
+
+
+def clip_line(line, width, ellipsis="…"):
+    if line_width(line) <= width:
+        return line
+    limit = max(0, width - dwidth(ellipsis))
+    out, used = [], 0
+    for text, style in line:
+        size = dwidth(text)
+        if used + size <= limit:
+            out.append((text, style))
+            used += size
+            continue
+        out.append((clip(text, limit - used), style))
+        break
+    out.append((clip(ellipsis, width), "dim"))
+    return out
+
+
+_CJK = "⺀-鿿　-〿＀-￯"
+_WRAP_TOKEN = re.compile(rf"\s+|[{_CJK}]|[^\s{_CJK}]+")
+
+
+def wrap_text(text, width):
+    """Wrap by display width; CJK may break between characters, words at spaces."""
+    width = max(1, width)
+    lines, current = [], ""
+    for token in _WRAP_TOKEN.findall(text):
+        if token.isspace():
+            if current:
+                current += " "
+            continue
+        if dwidth(current + token) <= width:
+            current += token
+            continue
+        if current.strip():
+            lines.append(current.rstrip())
+        current = ""
+        while dwidth(token) > width:
+            head = clip(token, width)
+            lines.append(head)
+            token = token[len(head):]
+        current = token
+    if current.strip() or not lines:
+        lines.append(current.rstrip())
+    return lines
+
+
+def flow(prefix, chunks, width, indent, sep="  ", ellipsis="…"):
+    """Lay chunks on a line after prefix, wrapping to indent when too wide."""
+    lines, current = [], list(prefix)
+    used, fresh = line_width(current), True
+    for chunk in chunks:
+        size = line_width(chunk)
+        gap = 0 if fresh else dwidth(sep)
+        if not fresh and used + gap + size > width:
+            lines.append(current)
+            current, used, fresh, gap = [(" " * indent, "")], indent, True, 0
+            if chunk and chunk[0][0][:1] == " ":  # no stray space at a wrapped line start
+                chunk = [(chunk[0][0].lstrip(), chunk[0][1])] + list(chunk[1:])
+                size = line_width(chunk)
+        if gap:
+            current.append((sep, ""))
+            used += gap
+        current.extend(chunk)
+        used += size
+        fresh = False
+    lines.append(current)
+    return [clip_line(line, width, ellipsis) for line in lines]
+
+
+def label_prefix(st, label, style="label"):
+    return [(" " * INDENT, ""), (pad(st.t(label), st.lw), style)]
+
+
+def text_rows(st, label, text, width, style="", label_style="label"):
+    column = INDENT + st.lw
+    rows = []
+    for index, part in enumerate(wrap_text(text, max(8, width - column))):
+        head = label_prefix(st, label, label_style) if index == 0 else [(" " * column, "")]
+        rows.append(clip_line(head + [(part, style)], width, st.g("ellipsis")))
+    return rows
+
+
+def info_row(st, label, main, tail, width):
+    head = label_prefix(st, label) + main
+    ellipsis = st.g("ellipsis")
+    if not tail:
+        return [clip_line(head, width, ellipsis)]
+    if line_width(head) + 3 + line_width(tail) <= width:
+        return [head + [("   ", "")] + tail]
+    return [clip_line(head, width, ellipsis),
+            clip_line([(" " * (INDENT + st.lw), "")] + tail, width, ellipsis)]
+
+
+def hhmm(minute):
+    return f"{minute // 60:02d}:{minute % 60:02d}"
+
+
+def human_bytes(size):
+    size = size or 0
+    for unit, scale in (("GB", 1024 ** 3), ("MB", 1024 ** 2), ("KB", 1024)):
+        if size >= scale:
+            return f"{size / scale:.1f} {unit}"
+    return f"{size} B"
+
+
+def hours_text(value):
+    return f"{value:g}"
+
+
+def coords_text(st, cfg):
+    deg = st.g("deg")
+    lat, lon = cfg["lat"], cfg["lon"]
+    text = (f"{abs(lat):.4f}{deg}{'N' if lat >= 0 else 'S'} "
+            f"{abs(lon):.4f}{deg}{'E' if lon >= 0 else 'W'}")
+    return f"{cfg['city']} {st.g('dot')} {text}" if cfg.get("city") else text
+
+
+def durations_text(st, cfg):
+    return st.t("早晨 {m} 小时 · 傍晚自日落前 {b} 至日落后 {a} 小时",
+                m=hours_text(cfg["morningHoursAfterSunrise"]),
+                b=hours_text(cfg["eveningHoursBeforeSunset"]),
+                a=hours_text(cfg["eveningHoursAfterSunset"]))
+
+
+def parse_when(value):
+    try:
+        return dt.datetime.fromisoformat(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def when_text(st, when, now):
+    days = (when.date() - now.date()).days
+    base = when.strftime("%H:%M")
+    if days == 0:
+        return base
+    if days == 1:
+        return st.t("明天") + " " + base
+    return st.t("{m}月{d}日", m=when.month, d=when.day) + " " + base
+
+
+def countdown_text(st, seconds, precise=False):
+    if seconds <= 0:
+        return st.t("即将切换")
+    if precise:
+        total = int(seconds)
+        if total < 3600:
+            return st.t("{m} 分 {s:02d} 秒后", m=total // 60, s=total % 60)
+        if total < 86400:
+            return st.t("{h} 小时 {m:02d} 分后", h=total // 3600, m=total % 3600 // 60)
+        return st.t("{d} 天 {h} 小时后", d=total // 86400, h=total % 86400 // 3600)
+    minutes = math.ceil(seconds / 60)
+    if minutes < 60:
+        return st.t("约 {m} 分钟后", m=minutes)
+    if minutes < 1440:
+        hours, rest = divmod(minutes, 60)
+        return st.t("约 {h} 小时后", h=hours) if not rest else st.t("约 {h} 小时 {m} 分钟后", h=hours, m=rest)
+    return st.t("约 {d} 天后", d=round(minutes / 1440))
+
+
+def day_schedule(now, cfg):
+    """Classify every minute of today's local date exactly as apply would."""
+    rise, setting, cos_ha = solar(now, cfg["lat"], cfg["lon"])
+    minutes = [period_at(minute / 60, rise, setting, cos_ha, cfg) for minute in range(1440)]
+    starts = [(minutes[m], m) for m in range(1440) if minutes[m] != minutes[m - 1]]
+    first = next((i for i, (period, _) in enumerate(starts) if period == "morning"), 0)
+    condition = "polar night" if cos_ha >= 1 else "polar day" if cos_ha <= -1 else "normal"
+    return {"condition": condition, "minutes": minutes, "starts": starts[first:] + starts[:first]}
+
+
+def bar_width_for(width, maximum=48):
+    return max(8, min(maximum, width - INDENT - 1))
+
+
+def bar_cells(schedule, bar_width):
+    return [schedule["minutes"][min(1439, int((column + 0.5) * 1440 / bar_width))]
+            for column in range(bar_width)]
+
+
+def marker_column(now, bar_width):
+    return min(bar_width - 1, (now.hour * 60 + now.minute) * bar_width // 1440)
+
+
+def timeline_lines(st, schedule, now, width, bar_width):
+    ellipsis = st.g("ellipsis")
+    if schedule["starts"]:
+        chunks = [[(hhmm(minute) + " ", "dim"), (st.t(PERIOD_NAMES[period]), period)]
+                  for period, minute in schedule["starts"]]
+    else:
+        period = schedule["minutes"][0]
+        name, note = (("极昼", " · 全天白天") if period == "day" else ("极夜", " · 全天夜晚"))
+        chunks = [[(st.t(name), period), (st.t(note), "dim")]]
+    lines = flow([(" " * INDENT, "")], chunks, width, INDENT, sep="   ", ellipsis=ellipsis)
+    bar = [(" " * INDENT, "")]
+    for period in bar_cells(schedule, bar_width):
+        if bar[-1][1] == period:
+            bar[-1] = (bar[-1][0] + st.bar(period), period)
+        else:
+            bar.append((st.bar(period), period))
+    lines.append(clip_line(bar, width, ellipsis))
+    column = INDENT + marker_column(now, bar_width)
+    label = st.t("现在") + " " + now.strftime("%H:%M")
+    if column + 2 + dwidth(label) <= width:
+        marker = [(" " * column, ""), (st.g("marker"), "marker"), (" " + label, "dim")]
+    else:
+        text = label + " "
+        start = max(0, column - dwidth(text))
+        marker = [(" " * start, ""), (clip(text, column - start), "dim"), (st.g("marker"), "marker")]
+    lines.append(clip_line(marker, width, ellipsis))
+    return lines
+
+
+VIDEO_STATES = ("protected", "unprotected", "restorable", "downloading", "missing")
+STATE_GLYPH = {
+    "protected": ("ok", "ok"), "unprotected": ("unpinned", "warn"),
+    "restorable": ("restorable", "dim"), "downloading": ("downloading", "accent"),
+    "missing": ("missing", "warn"), "absent": ("fail", "err"),
+}
+STATE_TEXT = {
+    "unprotected": "未保护", "restorable": "可从保护恢复", "downloading": "下载中",
+    "missing": "缺失，应用时下载", "absent": "素材清单中缺失",
+}
+
+
+def video_state(video):
+    if video.get("present") and video.get("pinned") and video.get("sameInode"):
+        return "protected"
+    if video.get("present"):
+        return "unprotected"
+    return "restorable" if video.get("pinned") else "missing"
+
+
+def video_states(snap):
+    states = {}
+    videos = (snap or {}).get("videos") or {}
+    for period in PERIODS:
+        video = videos.get(period)
+        if isinstance(video, dict):
+            states[period] = video_state(video)
+    if snap and snap.get("downloadInProgress"):
+        # One download runs at a time: the current period first, then later ones.
+        start = PERIODS.index(snap["period"]) if snap.get("period") in PERIODS else 0
+        for offset in range(len(PERIODS)):
+            period = PERIODS[(start + offset) % len(PERIODS)]
+            if states.get(period) == "missing":
+                states[period] = "downloading"
+                break
+    return states
+
+
+def state_legend(st, states, width, legend_texts=None):
+    texts = dict(STATE_TEXT, **(legend_texts or {}))
+    shown = [s for s in ("unprotected", "restorable", "downloading", "missing", "absent")
+             if s in states.values()]
+    if not shown:
+        return []
+    column = INDENT + st.lw
+    chunks = [[(st.g(STATE_GLYPH[s][0]) + " ", STATE_GLYPH[s][1]), (st.t(texts[s]), "dim")] for s in shown]
+    return flow([(" " * column, "")], chunks, width, column, ellipsis=st.g("ellipsis"))
+
+
+def video_rows(st, states, width, pinned_bytes=None, legend_texts=None):
+    chunks = []
+    for period in PERIODS:
+        if period in states:
+            glyph, style = STATE_GLYPH[states[period]]
+            chunks.append([(st.t(PERIOD_NAMES[period]) + " ", ""), (st.g(glyph), style)])
+    if pinned_bytes is not None:
+        text = st.t("已保护 {size}", size=human_bytes(pinned_bytes)) if pinned_bytes else st.t("未保护")
+        chunks.append([(" " + text, "dim")])
+    rows = flow(label_prefix(st, "视频"), chunks, width, INDENT + st.lw, ellipsis=st.g("ellipsis"))
+    return rows + state_legend(st, states, width, legend_texts)
+
+
+def now_next_rows(st, snap, cfg, now, width, applied=None, precise=False):
+    series = SERIES.get(snap.get("series"), {})
+    period = snap.get("period")
+    current_name = series.get(period, ("", "—"))[1]
+    when = parse_when(snap.get("nextSwitch"))
+    next_period = current_period(when, cfg) if when else None
+    next_name = series.get(next_period, ("", ""))[1] if next_period else ""
+    name_width = max(dwidth(current_name), dwidth(next_name))
+    if applied is None:
+        applied = (snap.get("plist") or {}).get("allMatch")
+    status = ([(st.g("ok") + " " + st.t("已应用"), "ok")] if applied
+              else [(st.g("unpinned") + " " + st.t("待切换"), "warn")])
+    period_width = max(dwidth(st.t(name)) for name in PERIOD_NAMES.values())
+    main = [(pad(st.t(PERIOD_NAMES.get(period, period or "?")), period_width) + "  ", period or ""),
+            (pad(current_name, name_width), "strong")]
+    rows = info_row(st, "当前", main, status, width)
+    if when:
+        seconds = (when - now).total_seconds()
+        main = [(pad(st.t(PERIOD_NAMES[next_period]), period_width) + "  ", next_period),
+                (pad(next_name, name_width), "")]
+        tail = [(when_text(st, when, now), ""),
+                (st.t("（{c}）", c=countdown_text(st, seconds, precise)), "dim")]
+    else:
+        main, tail = [("—", "dim")], [(st.t("极昼或极夜期间不切换"), "dim")]
+    return rows + info_row(st, "下一张", main, tail, width)
+
+
+def agent_rows(st, loaded_now, width):
+    if loaded_now:
+        return text_rows(st, "定时", st.t("运行中 · 每 15 分钟检查"), width)
+    return text_rows(st, "定时", st.t("未运行 · 运行 aerial-switch install 启用"), width, "warn")
+
+
+WARNING_PATTERNS = (
+    (r"Pin protection skipped", "视频与保护目录不在同一磁盘，已跳过硬链接保护"),
+    (r"Current video unavailable: (\w+)", "当前时段视频暂不可用（{0}），保持原壁纸，下次检查重试"),
+    (r"Prefetch failed: (\w+)", "预取下一张失败（{0}），下次检查重试"),
+    (r"Downloaded but not protected: (.*)", "已下载但未受保护：{0}"),
+    (r"Prefetched but not protected: (.*)", "已预取但未受保护：{0}"),
+    (r"(?:pin|restore|replacePin) (\S+): (.*)", "硬链接保护失败（{0}）：{1}"),
+    (r"DownloadBusy", "另一个检查正在下载视频，保持原壁纸"),
+    (r"(.*)", "下载失败：{0}"),
+)
+
+
+def warning_text(st, text, patterns=WARNING_PATTERNS[:-2]):
+    for pattern, template in patterns:
+        match = re.match(pattern, text)
+        if match:
+            return st.t(template).format(*match.groups())
+    return text
+
+
+def download_error_text(st, text):
+    return warning_text(st, text, WARNING_PATTERNS[-2:])
+
+
+def status_warnings(st, snap):
+    items = []
+    legacy = (snap or {}).get("legacyAgents") or []
+    if legacy:
+        labels = st.join(item.get("label", "?") for item in legacy)
+        items.append(st.t("发现旧版定时任务 {labels}；运行 aerial-switch install --migrate 迁移", labels=labels))
+    unprotected = [p for p, s in video_states(snap).items() if s == "unprotected"]
+    if unprotected:
+        names = st.join(st.t(PERIOD_NAMES[p]) for p in unprotected)
+        items.append(st.t("{names} 视频尚未受硬链接保护，下次检查时补上", names=names))
+    return items
+
+
+def warning_lines(st, items, width, style="warn"):
+    column = INDENT + st.lw
+    lines = []
+    for index, item in enumerate(items):
+        for part_index, part in enumerate(wrap_text(item, max(8, width - column - 2))):
+            head = (label_prefix(st, "注意", style) if index == 0 and part_index == 0
+                    else [(" " * column, "")])
+            mark = [(st.g("warn") + " ", style)] if part_index == 0 else [("  ", "")]
+            lines.append(clip_line(head + mark + [(part, "")], width, st.g("ellipsis")))
+    return lines
+
+
+def header_lines(st, parts, width, rule_width, right=None):
+    title = [(" ", ""), ("Aerial Switch", "title")]
+    for text, style in parts:
+        if text:
+            title += [(" " + st.g("dot") + " ", "dim"), (text, style)]
+    if right:
+        gap = width - line_width(title) - dwidth(right) - 1
+        if gap >= 2:
+            title += [(" " * gap, ""), (right, "dim")]
+    rule = [(" ", ""), (st.g("rule") * max(1, min(rule_width, width - 1)), "dim")]
+    return [clip_line(title, width, st.g("ellipsis")), rule]
+
+
+def page(st, parts, body, width):
+    rule_width = max([line_width(line) for line in body] + [24]) - 1
+    return header_lines(st, parts, width, rule_width) + body
+
+
+def series_title(snap_or_cfg):
+    key = snap_or_cfg.get("series")
+    return [(SERIES[key]["name"] if key in SERIES else str(key), "series"),
+            (snap_or_cfg.get("city") or "", "")]
+
+
+def status_lines(st, snap, cfg, now, width, outcome=None, extra_warnings=(), applied=None,
+                 suffix=None):
+    body = timeline_lines(st, day_schedule(now, cfg), now, width, bar_width_for(width))
+    body.append([])
+    body += now_next_rows(st, snap, cfg, now, width, applied)
+    body.append([])
+    body += video_rows(st, video_states(snap), width, snap.get("pinnedBytes"))
+    body += agent_rows(st, snap.get("launchAgentLoaded"), width)
+    if outcome:
+        body.append([])
+        body += outcome
+    warnings = list(extra_warnings) + status_warnings(st, snap)
+    if warnings:
+        body.append([])
+        body += warning_lines(st, warnings, width)
+    parts = series_title(snap) + ([(st.t(suffix), "accent")] if suffix else [])
+    return page(st, parts, body, width)
+
+
+ACTION_TEXT = {"pin": "保护{p}视频", "restore": "恢复{p}视频", "replacePin": "更新{p}视频的保护",
+               "download": "下载{p}视频", "prefetch": "预取{p}视频"}
+
+
+def action_words(st, result):
+    periods = {v.get("assetID"): p for p, v in (result.get("videos") or {}).items()}
+    words = []
+    for action in result.get("plannedActions") or []:
+        kind = action.get("action")
+        if kind == "removePins":
+            words.append(st.t("移除其他系列的保护"))
+        elif kind == "switch":
+            words.append(st.t("切换壁纸"))
+        elif kind in ACTION_TEXT:
+            asset = action.get("assetID") or ""
+            name = st.t(PERIOD_NAMES[periods[asset]]) if asset in periods else asset[:8]
+            words.append(st.t(ACTION_TEXT[kind], p=name))
+    return words
+
+
+def apply_lines(st, result, cfg, now, width, dry_run):
+    words = action_words(st, result)
+    dot = f" {st.g('dot')} "
+    warnings = []
+    if result.get("downloadError"):
+        warnings.append(download_error_text(st, result["downloadError"]))
+    warnings += [warning_text(st, w) for w in result.get("warnings") or []
+                 if not (result.get("downloadError") and w.startswith("Current video unavailable"))]
+    if dry_run:
+        text = st.t("将：{0}").format(dot.join(words)) if words else st.t("无需任何操作")
+        outcome = text_rows(st, "预演", text, width)
+        return status_lines(st, result, cfg, now, width, outcome, warnings, suffix="预演")
+    name = st.t(PERIOD_NAMES.get(result.get("period"), ""))
+    if result.get("downloadError"):
+        outcome = text_rows(st, "本次", st.g("fail") + " " + st.t("未切换：视频下载失败，保持原壁纸"), width, "err")
+    elif result.get("updated"):
+        outcome = text_rows(st, "本次", st.g("ok") + " " + st.t("已切换到{p}壁纸", p=name), width, "ok")
+    else:
+        outcome = text_rows(st, "本次", st.g("ok") + " " + st.t("壁纸已是最新，无需切换"), width, "ok")
+    done = [w for w in words if w != st.t("切换壁纸")]
+    if done:
+        outcome += text_rows(st, "", dot.join(done), width, "dim")
+    applied = None if result.get("downloadError") else True
+    return status_lines(st, result, cfg, now, width, outcome, warnings, applied)
+
+
+def series_list_lines(st, payload, current, width, videos=None):
+    """Both series with the same per-video symbols as status.  ``videos`` maps
+    series -> period -> present/pinned/sameInode (see series_videos); without
+    it a downloaded video is shown as not protected rather than guessed."""
+    keys = [k for k in SERIES_ORDER if k in payload] + [k for k in payload if k not in SERIES_ORDER]
+    names = {key: payload[key].get("name", key) for key in keys}
+    name_width = max([dwidth(n) for n in names.values()] + [1])
+    body, seen, others_unprotected, current_unprotected = [], {}, False, []
+    for key in keys:
+        info = payload[key]
+        is_current = key == current
+        cache = (videos or {}).get(key) or {}
+        chunks = []
+        for period in PERIODS:
+            label = SERIES.get(key, {}).get(period, ("", ""))[1]
+            if label in (info.get("missing") or []):
+                state = "absent"
+            elif isinstance(cache.get(period), dict):
+                state = video_state(cache[period])
+            else:
+                state = "missing" if label in (info.get("notDownloaded") or []) else "unprotected"
+            seen[period + key] = state
+            glyph, style = STATE_GLYPH[state]
+            if state in ("unprotected", "restorable"):
+                if is_current:
+                    current_unprotected += [period] if state == "unprotected" else []
+                else:
+                    others_unprotected, style = True, "dim"  # expected: only the selected series is pinned
+            chunks.append([(st.t(PERIOD_NAMES[period]) + " ", ""), (st.g(glyph), style)])
+        if is_current:
+            chunks.append([(" " + st.t("当前"), "dim")])
+        prefix = [(" " * INDENT, ""),
+                  (st.g("current") if is_current else st.g("other"), "accent" if is_current else "dim"),
+                  (" " + pad(names[key], name_width) + "   ", "strong" if is_current else "")]
+        body += flow(prefix, chunks, width, line_width(prefix), ellipsis=st.g("ellipsis"))
+    body += state_legend(st, seen, width, {"missing": "未下载，应用时自动下载"})
+    if others_unprotected:
+        column = INDENT + st.lw
+        body += [[(" " * column, ""), (part, "dim")]
+                 for part in wrap_text(st.t("未选中的系列不受保护，系统可能清理"), max(8, width - column))]
+    body.append([])
+    body += text_rows(st, "切换", st.t("用 aerial-switch series goldenGate 或 tahoe 选择"), width, "dim")
+    if current_unprotected:
+        names_text = st.join(st.t(PERIOD_NAMES[p]) for p in current_unprotected)
+        body.append([])
+        body += warning_lines(st, [st.t("{names} 视频尚未受硬链接保护，下次检查时补上", names=names_text)], width)
+    return page(st, [(st.t("系列"), "")], body, width)
+
+
+def series_saved_lines(st, result, width):
+    key = result.get("series")
+    name = SERIES.get(key, {}).get("name", key)
+    protection = result.get("protection") or {}
+    pin_warnings = protection.get("warnings") or []
+    body = [[(" " * INDENT, ""), (st.g("ok") + " " + st.t("已选择 {name}", name=name), "ok")]]
+    body += [[(" " * (INDENT + 2), ""), (part, "dim")] for part in wrap_text(
+        st.t("下次检查时生效（最多 15 分钟），或运行 aerial-switch apply 立即应用"), width - INDENT - 2)]
+    body.append([])
+    missing = result.get("notDownloaded") or []
+    states = {p: ("missing" if SERIES.get(key, {}).get(p, ("", ""))[1] in missing
+                  else "unprotected" if pin_warnings else "protected") for p in PERIODS}
+    body += video_rows(st, states, width, legend_texts={"missing": "未下载，应用时自动下载"})
+    actions = protection.get("actions") or []
+    pinned = sum(a.get("action") in ("pin", "replacePin", "restore") for a in actions)
+    parts = ([st.t("新增保护 {n} 个视频", n=pinned)] if pinned else []) + (
+        [st.t("移除其他系列的保护")] if any(a.get("action") == "removePins" for a in actions) else [])
+    body += text_rows(st, "保护", f" {st.g('dot')} ".join(parts) or st.t("无变化"), width)
+    if pin_warnings:
+        body.append([])
+        body += warning_lines(st, [warning_text(st, w) for w in pin_warnings], width)
+    return page(st, series_title(result), body, width)
+
+
+def location_saved_lines(st, cfg, now, width):
+    body = [[(" " * INDENT, ""), (st.g("ok") + " " + st.t("位置已保存"), "ok"),
+             ("   " + coords_text(st, cfg), "")]]
+    body = [clip_line(body[0], width, st.g("ellipsis")), []]
+    body += timeline_lines(st, day_schedule(now, cfg), now, width, bar_width_for(width))
+    body.append([])
+    body += [[(" " * INDENT, ""), (part, "dim")] for part in wrap_text(st.t("下次检查时按新位置切换"), width - INDENT)]
+    return page(st, series_title(cfg), body, width)
+
+
+def tilde(path, home):
+    path, home = str(path), str(home)
+    return "~" + path[len(home):] if home and path.startswith(home + os.sep) else path
+
+
+def install_lines(st, result, width, paths):
+    body = [[(" " * INDENT, ""), (st.g("ok") + " " + st.t("已安装并启动定时任务"), "ok")], []]
+    body += text_rows(st, "程序", tilde(result.get("installed", ""), paths.home), width)
+    body += text_rows(st, "定时", st.t("com.local.aerial-switch · 每 15 分钟检查"), width)
+    body += text_rows(st, "日志", tilde(paths.log, paths.home), width)
+    migration = result.get("migration") or {}
+    if migration.get("labels"):
+        text = st.t("已停用 {n} 个旧版任务", n=len(migration["labels"]))
+        if migration.get("backupDirectory"):
+            text += f" {st.g('dot')} " + st.t("备份于 {0}").format(tilde(migration["backupDirectory"], paths.home))
+        body += text_rows(st, "迁移", text, width)
+    return page(st, [(st.t("安装"), "")], body, width)
+
+
+def uninstall_lines(st, result, width):
+    body = [[(" " * INDENT, ""), (st.g("ok") + " " + st.t("已卸载定时任务"), "ok")], []]
+    body += text_rows(st, "已移除", st.t("硬链接保护目录"), width)
+    if result.get("restored"):
+        body += text_rows(st, "已恢复", st.t("上次的壁纸设置"), width)
+    body += text_rows(st, "已保留", st.t("程序、配置、状态与备份"), width, "dim")
+    return page(st, [(st.t("卸载"), "")], body, width)
+
+
+DOCTOR_NAMES = (("python", "Python"), ("config", "配置"), ("manifest", "素材清单"),
+                ("plist", "壁纸设置"), ("selectedVideos", "当前系列视频"),
+                ("cache", "视频缓存"), ("launchAgent", "定时任务"))
+
+
+def doctor_detail(st, key, check):
+    if not check.get("ok"):
+        return "fail", str(check.get("error", ""))
+    detail = check.get("detail")
+    dot = f" {st.g('dot')} "
+    if key == "python":
+        return "ok", str(detail)
+    if key == "config":
+        return "ok", SERIES.get(detail.get("series"), {}).get("name", "?") + dot + coords_text(st, detail)
+    if key == "manifest":
+        problems = [st.t("{name} 缺少 {n} 个", name=i.get("name"), n=len(i["missing"]))
+                    for i in detail.values() if i.get("missing")]
+        if problems:
+            return "warn", "；".join(problems) if not st.english else "; ".join(problems)
+        text = st.t("{names} 均已找到", names=st.join(i.get("name", "?") for i in detail.values()))
+        pending = [st.t("{name} {n} 个未下载", name=i.get("name"), n=len(i["notDownloaded"]))
+                   for i in detail.values() if i.get("notDownloaded")]
+        return "ok", text + (st.t("（{c}）", c=st.join(pending)) if pending else "")
+    if key == "plist":
+        return "ok", st.t("桌面 {d} · 待机 {i}", d=detail.get("desktopCount"), i=detail.get("idleCount"))
+    if key == "selectedVideos":
+        pending = detail.get("notDownloaded") or []
+        if pending:
+            return "warn", st.t("{n} 个未下载（{names}），应用时会自动恢复或下载",
+                                n=len(pending), names=", ".join(pending))
+        return "ok", st.t("{n} 个视频均已下载", n=len(detail.get("ids") or {}))
+    if key == "cache":
+        states = video_states({"videos": detail.get("videos"), "downloadInProgress": detail.get("downloadInProgress")})
+        protected = sum(s == "protected" for s in states.values())
+        parts = [st.t("{a}/{b} 已保护", a=protected, b=len(states)), human_bytes(detail.get("pinnedBytes"))]
+        if detail.get("downloadInProgress"):
+            parts.append(st.t("正在下载"))
+        proxy = detail.get("proxy") or {}
+        parts.append(st.t("系统代理 {s}", s=st.join(proxy.get("schemes") or [])) if proxy.get("detected")
+                     else st.t("无系统代理"))
+        return ("ok" if protected == len(states) else "warn"), dot.join(parts)
+    if key == "launchAgent":
+        text = st.t("运行中") if detail.get("loaded") else st.t("未运行 · 运行 aerial-switch install 启用")
+        if detail.get("legacyAgents"):
+            return "warn", text + dot + st.t("发现旧版任务，运行 install --migrate 迁移")
+        return ("ok" if detail.get("loaded") else "warn"), text
+    return "ok", json.dumps(detail, ensure_ascii=False)[:200]
+
+
+def doctor_body(st, checks, width):
+    names = dict(DOCTOR_NAMES)
+    keys = [k for k, _ in DOCTOR_NAMES if k in checks] + [k for k in checks if k not in names]
+    name_width = max(dwidth(st.t(names.get(k, k))) for k in keys) + 2 if keys else 2
+    column = INDENT + 2 + name_width
+    body, counts = [], {"ok": 0, "warn": 0, "fail": 0}
+    for key in keys:
+        level, text = doctor_detail(st, key, checks[key])
+        counts[level] += 1
+        glyph, style = {"ok": ("ok", "ok"), "warn": ("warn", "warn"), "fail": ("fail", "err")}[level]
+        prefix = [(" " * INDENT, ""), (st.g(glyph) + " ", style), (pad(st.t(names.get(key, key)), name_width), "")]
+        for index, part in enumerate(wrap_text(text, max(8, width - column))):
+            head = prefix if index == 0 else [(" " * column, "")]
+            body.append(clip_line(head + [(part, "err" if level == "fail" else "dim" if level == "ok" else "")],
+                                  width, st.g("ellipsis")))
+    body.append([])
+    summary = []
+    if counts["fail"]:
+        summary.append((st.t("{n} 项失败", n=counts["fail"]), "err"))
+    if counts["warn"]:
+        summary.append((st.t("{n} 项需要注意", n=counts["warn"]), "warn"))
+    if not summary:
+        summary.append((st.g("ok") + " " + st.t("全部正常"), "ok"))
+    line = [(" " * INDENT, "")]
+    for index, item in enumerate(summary):
+        line += ([(f" {st.g('dot')} ", "dim")] if index else []) + [item]
+    body.append(line)
+    return body
+
+
+def doctor_lines(st, checks, width):
+    return page(st, [(st.t("自检"), "")], doctor_body(st, checks, width), width)
+
+
+def render_ansi(st, lines):
+    out = []
+    for line in lines:
+        text = ""
+        for chunk, style in line:
+            code = st.ansi(style) if st.color and chunk.strip() else ""
+            text += f"\033[{code}m{chunk}\033[0m" if code else chunk
+        out.append(text.rstrip())
+    return "\n".join(out) + "\n"
+
+
+def write_text(text, stream):
+    try:
+        stream.write(text)
+    except UnicodeEncodeError:
+        encoding = getattr(stream, "encoding", None) or "ascii"
+        stream.write(text.encode(encoding, "replace").decode(encoding))
+    stream.flush()
+
+
+def terminal_width():
+    return max(20, shutil.get_terminal_size((80, 24)).columns)
+
+
+def show(view, stream=None):
+    stream = stream or sys.stdout
+    st = Style.for_stream(stream)
+    lines = view(st, terminal_width(), dt.datetime.now().astimezone())
+    write_text(render_ansi(st, lines), stream)
+
+
+# ---------------------------------------------------------------------------
+# Interactive dashboard.  Dashboard holds state and key handling and renders
+# span lines; tui_loop paints them with curses.  Both take injected backends,
+# screens and key readers so tests never need a real terminal.
+
+RELOAD_SECONDS = 30
+MIN_WIDTH, MIN_HEIGHT = 44, 16
+LOCATION_FIELDS = (("lat", "纬度", "-90 ~ 90"), ("lon", "经度", "-180 ~ 180"), ("city", "城市", "可留空"))
+DURATION_FIELDS = (("morningHoursAfterSunrise", "早晨时长", "日出后"),
+                   ("eveningHoursBeforeSunset", "傍晚提前", "日落前开始"),
+                   ("eveningHoursAfterSunset", "傍晚延后", "日落后结束"))
+FOOTER_KEYS = {
+    "main": (("lr", "系列"), ("Enter", "切换"), ("A", "应用"), ("L", "位置"), ("T", "时段"),
+             ("D", "自检"), ("?", "帮助"), ("Q", "退出")),
+    "confirm": (("Y", "确认"), ("N", "取消")),
+    "location": (("Tab", "下一项"), ("Enter", "保存"), ("Esc", "取消")),
+    "durations": (("ud", "选择"), ("lr", "调整 0.5 小时"), ("Enter", "保存"), ("Esc", "取消")),
+    "doctor": (("R", "重新自检"), ("Esc", "返回"), ("Q", "退出")),
+    "help": (("Esc", "返回"), ("Q", "退出")),
+    "busy": (("lr", "系列"), ("?", "帮助"), ("Q", "退出")),
+}
+HELP_KEYS = (("lr / Tab", "在 Golden Gate 与 Tahoe 之间选择"), ("Enter", "切换到所选系列，下次检查时生效"),
+             ("A", "立即应用当前时段壁纸（会先确认）"), ("L", "修改位置：纬度、经度、城市"),
+             ("T", "调整早晨与傍晚时段（0–6 小时，步进 0.5）"), ("D", "运行自检"),
+             ("R", "立即重新读取状态"), ("?", "显示本帮助"), ("Q / Esc", "退出"))
+HELP_NOTES = ("状态每 30 秒自动刷新，时间与倒计时每秒更新。", "定时任务每 15 分钟检查一次并按时段切换壁纸。",
+              "应用等操作在后台进行，期间可浏览；连按两次 Q 强制退出，未完成的下载下次续传。",
+              "卸载等操作请在命令行运行 aerial-switch uninstall。")
+
+
+def error_text(error):
+    if isinstance(error, OSError) and error.strerror and error.filename:
+        return f"{error.strerror} ({tilde(error.filename, Path.home())})"
+    return " ".join(str(error).split()) or type(error).__name__
+
+
+def number_text(value):
+    return (f"{value:.6f}").rstrip("0").rstrip(".")
+
+
+class LocalBackend:
+    def __init__(self, paths):
+        self.paths = paths
+
+    def config(self):
+        return load_config(self.paths)
+
+    def catalog(self):
+        return {key: series_payload(str(self.paths.manifest), key, str(self.paths.videos)) for key in SERIES}
+
+    def snapshot(self, cfg):
+        return snapshot(self.paths, cfg)
+
+    def set_series(self, name):
+        return save_series(self.paths, name)
+
+    def apply(self):
+        return apply_command(self.paths, False)[1]
+
+    def set_location(self, lat, lon, city):
+        return save_location(self.paths, lat, lon, city)
+
+    def set_durations(self, values):
+        return save_config_values(self.paths, **values)
+
+    def doctor(self):
+        return doctor(self.paths)
+
+
+class Dashboard:
+    def __init__(self, backend, style, clock=None):
+        self.backend, self.st = backend, style
+        self.clock = clock or (lambda: dt.datetime.now().astimezone())
+        # tui_loop sets background: writes then run on a daemon thread while
+        # the screen keeps refreshing.  Direct callers (tests) run them inline.
+        self.background = False
+        self.task = None  # the running write: label, start time, outcome
+        self.quit_armed = self.exit_waiting = False
+        self.busy_note = None  # (text, shown until)
+        self.editor_visible = True
+        self.mode, self.message = "main", None
+        self.cfg = self.snap = None
+        self.catalog, self.load_errors = {}, []
+        self.loaded_at = None
+        self.cursor = 0
+        self.fields, self.field = {}, 0
+        self.draft, self.draft_row = {}, 0
+        self.doctor_result = None
+        self._schedule_cache = (None, None)
+        self.reload(initial=True)
+
+    # -- data -------------------------------------------------------------
+    def reload(self, initial=False):
+        st = self.st
+        self.loaded_at = self.clock()
+        self.load_errors = []
+        try:
+            self.cfg = self.backend.config()
+        except Exception as error:  # show any read failure inside the UI
+            self.cfg = self.snap = None
+            self.load_errors.append(st.t("读取配置失败：{0}").format(error_text(error)))
+            return
+        try:
+            self.catalog = self.backend.catalog()
+        except Exception as error:
+            self.catalog = {}
+            self.load_errors.append(st.t("读取素材清单失败：{0}").format(error_text(error)))
+        try:
+            self.snap = self.backend.snapshot(self.cfg)
+        except Exception as error:
+            self.snap = None
+            if not any(error_text(error) in item for item in self.load_errors):
+                self.load_errors.append(st.t("读取状态失败：{0}").format(error_text(error)))
+        if initial and self.cfg.get("series") in SERIES_ORDER:
+            self.cursor = SERIES_ORDER.index(self.cfg["series"])
+
+    def needs_reload(self, now):
+        if self.task is not None:
+            return False  # reloaded when the running write finishes
+        if self.loaded_at is None or (now - self.loaded_at).total_seconds() >= RELOAD_SECONDS:
+            return True
+        when = parse_when(self.snap.get("nextSwitch")) if self.snap else None
+        return bool(when and self.loaded_at < when <= now)
+
+    def schedule(self, now, cfg):
+        key = (now.date(), cfg["lat"], cfg["lon"]) + tuple(cfg[k] for k, _, _ in DURATION_FIELDS)
+        if self._schedule_cache[0] != key:
+            self._schedule_cache = (key, day_schedule(now, cfg))
+        return self._schedule_cache[1]
+
+    # -- writes -------------------------------------------------------------
+    def perform(self, label, operation, done=None, name="操作", refresh=True):
+        """Run a write.  Reload status afterwards (when refresh), then call
+        done(result) on success or show the error on failure.  In background mode the operation runs on a
+        daemon thread and poll() finishes it on the UI thread."""
+        if self.task is not None:
+            self.note_busy()
+            return False
+        task = {"label": label, "name": name, "done": done, "refresh": refresh,
+                "started": self.clock(), "outcome": None}
+
+        def run():
+            try:
+                outcome = (True, operation())
+            except Exception as error:  # write errors must never leave the UI
+                outcome = (False, error)
+            task["outcome"] = outcome  # a single assignment hands the result over
+
+        self.task, self.message, self.quit_armed, self.busy_note = task, None, False, None
+        if not self.background:
+            run()
+            self.poll()
+            return True
+        threading.Thread(target=run, name="aerial-switch-write", daemon=True).start()
+        return True
+
+    def poll(self):
+        """Finish a completed background write; True when one finished."""
+        task = self.task
+        if task is None or task["outcome"] is None:
+            return False
+        self.task, self.quit_armed, self.busy_note = None, False, None
+        ok, value = task["outcome"]
+        if task["refresh"]:
+            self.reload()  # writes may change pins, videos or settings even when they fail
+        if ok:
+            if task["done"] is not None:
+                task["done"](value)
+        else:
+            self.message = (self.st.g("fail") + " " + self.st.t("操作失败：{0}").format(error_text(value)), "err")
+        return True
+
+    def note_busy(self):
+        self.busy_note = (self.st.t("{name}进行中，完成后再操作", name=self.st.t(self.task["name"])),
+                          self.clock() + dt.timedelta(seconds=3))
+
+    # -- keys ---------------------------------------------------------------
+    def handle_key(self, key):
+        """Handle one normalised key; return False to quit."""
+        if key in (None, "RESIZE") or self.exit_waiting:
+            return True
+        if self.task is not None:
+            return self._key_busy(key)
+        if self.mode in ("location", "durations") and not self.editor_visible and key != "ESC":
+            # Never edit or save fields the user cannot see.
+            self.message = (self.st.t("窗口太小，编辑框未显示：请放大窗口，或按 Esc 取消"), "warn")
+            return True
+        return getattr(self, "_key_" + self.mode)(key)
+
+    def _key_busy(self, key):
+        """Keys while a write runs: browsing works, writes wait, Q twice quits."""
+        if key in ("q", "Q") or (key == "ESC" and self.mode != "help"):
+            if self.quit_armed:
+                return False
+            self.quit_armed = True
+            return True
+        self.quit_armed = False
+        if self.mode == "help" and key in ("ESC", "ENTER", "?", "BACKSPACE"):
+            self.mode = "main"
+        elif self.mode == "main" and key in ("LEFT", "BTAB", "UP", "RIGHT", "TAB", "DOWN"):
+            step = -1 if key in ("LEFT", "BTAB", "UP") else 1
+            self.cursor = (self.cursor + step) % len(SERIES_ORDER)
+        elif self.mode == "main" and key == "?":
+            self.mode = "help"
+        else:
+            self.note_busy()
+        return True
+
+    def _key_main(self, key):
+        st = self.st
+        self.message = None
+        if key in ("q", "Q", "ESC"):
+            return False
+        if key in ("LEFT", "BTAB", "UP"):
+            self.cursor = (self.cursor - 1) % len(SERIES_ORDER)
+        elif key in ("RIGHT", "TAB", "DOWN"):
+            self.cursor = (self.cursor + 1) % len(SERIES_ORDER)
+        elif key == "ENTER":
+            self.switch_series()
+        elif key in ("a", "A"):
+            if self.snap is None:
+                self.message = (st.t("状态读取失败，无法应用；按 D 查看自检"), "err")
+            else:
+                self.mode = "confirm"
+        elif key in ("l", "L", "t", "T"):
+            if self.cfg is None:
+                self.message = (st.t("配置读取失败，按 R 重试"), "err")
+            elif key in ("l", "L"):
+                self.fields = {"lat": number_text(self.cfg["lat"]), "lon": number_text(self.cfg["lon"]),
+                               "city": self.cfg.get("city", "")}
+                self.field, self.mode = 0, "location"
+            else:
+                self.draft = {k: float(self.cfg[k]) for k, _, _ in DURATION_FIELDS}
+                self.draft_row, self.mode = 0, "durations"
+        elif key in ("d", "D"):
+            self.run_doctor()
+        elif key == "?":
+            self.mode = "help"
+        elif key in ("r", "R"):
+            self.reload()
+            self.message = (st.t("已刷新"), "dim")
+        return True
+
+    def switch_series(self):
+        st = self.st
+        key = SERIES_ORDER[self.cursor]
+        name = SERIES[key]["name"]
+        if self.cfg and self.cfg.get("series") == key:
+            self.message = (st.t("{name} 已是当前系列", name=name), "dim")
+            return
+
+        def done(result):
+            text = st.g("ok") + " " + st.t("已切换到 {name} · 下次检查时生效，或按 A 立即应用", name=name)
+            pending = result.get("notDownloaded") or []
+            if pending:
+                text += st.t("（{n} 个视频待下载）", n=len(pending))
+            warnings = (result.get("protection") or {}).get("warnings") or []
+            if warnings:
+                self.message = (text + f" {st.g('dot')} " + warning_text(st, warnings[0]), "warn")
+            else:
+                self.message = (text, "ok")
+
+        self.perform(st.t("正在切换到 {name}…", name=name), lambda: self.backend.set_series(key), done,
+                     "切换系列")
+
+    def _key_confirm(self, key):
+        st = self.st
+        if key in ("y", "Y", "ENTER"):
+            self.mode = "main"
+            self.perform(st.t("正在应用…（如需下载视频可能要等一会儿）"), self.backend.apply,
+                         lambda result: setattr(self, "message", self.apply_message(result)), "应用")
+        elif key in ("n", "N", "ESC", "q", "Q"):
+            self.mode, self.message = "main", (st.t("已取消"), "dim")
+        return True
+
+    def apply_message(self, result):
+        st = self.st
+        warnings = [warning_text(st, w) for w in result.get("warnings") or []
+                    if not w.startswith("Current video unavailable")]
+        if result.get("downloadError"):
+            text = (st.g("fail") + " " + st.t("未切换：视频下载失败，保持原壁纸") + f" {st.g('dot')} "
+                    + download_error_text(st, result["downloadError"]))
+            return text, "err"
+        series = SERIES.get(result.get("series"), {})
+        name = series.get(result.get("period"), ("", ""))[1]
+        text = st.g("ok") + " " + (st.t("已应用 {name}", name=name) if result.get("updated")
+                                   else st.t("壁纸已是最新，无需切换"))
+        if warnings:
+            return text + f" {st.g('dot')} " + warnings[0], "warn"
+        return text, "ok"
+
+    def _key_location(self, key):
+        st = self.st
+        name = LOCATION_FIELDS[self.field][0]
+        if key == "ESC":
+            self.mode, self.message = "main", (st.t("已取消，位置未修改"), "dim")
+        elif key in ("TAB", "DOWN"):
+            self.field = (self.field + 1) % len(LOCATION_FIELDS)
+        elif key in ("BTAB", "UP"):
+            self.field = (self.field - 1) % len(LOCATION_FIELDS)
+        elif key == "BACKSPACE":
+            self.fields[name] = self.fields[name][:-1]
+        elif key == "CLEAR":
+            self.fields[name] = ""
+        elif key == "ENTER":
+            self.save_location()
+        elif len(key) == 1 and key.isprintable():
+            if name != "city" and key not in "0123456789.-+":
+                self.message = (st.t("纬度和经度只能输入数字"), "warn")
+            elif dwidth(self.fields[name]) < (40 if name == "city" else 12):
+                self.fields[name] += key
+                self.message = None
+        return True
+
+    def save_location(self):
+        st = self.st
+        values = {}
+        for index, (name, label, _) in enumerate(LOCATION_FIELDS[:2]):
+            low, high = (-90, 90) if name == "lat" else (-180, 180)
+            try:
+                value = float(self.fields[name].strip())
+            except ValueError:
+                value = None
+            if value is None or not math.isfinite(value) or not low <= value <= high:
+                self.field = index
+                self.message = (st.g("fail") + " " + st.t("{label}需在 {low} 到 {high} 之间",
+                                                          label=st.t(label), low=low, high=high), "err")
+                return
+            values[name] = value
+        city = self.fields["city"].strip()
+
+        def done(_):
+            self.mode = "main"
+            self.message = (st.g("ok") + " " + st.t("位置已保存 · 下次检查时按新位置切换"), "ok")
+
+        self.perform(st.t("正在保存位置…"), lambda: self.backend.set_location(values["lat"], values["lon"], city),
+                     done, "保存位置")
+
+    def _key_durations(self, key):
+        st = self.st
+        name = DURATION_FIELDS[self.draft_row][0]
+        if key == "ESC":
+            self.mode, self.message = "main", (st.t("已取消，时段未修改"), "dim")
+        elif key in ("UP", "BTAB"):
+            self.draft_row = (self.draft_row - 1) % len(DURATION_FIELDS)
+        elif key in ("DOWN", "TAB"):
+            self.draft_row = (self.draft_row + 1) % len(DURATION_FIELDS)
+        elif key in ("LEFT", "RIGHT", "-", "+", "="):
+            step = -0.5 if key in ("LEFT", "-") else 0.5
+            self.draft[name] = min(6.0, max(0.0, round((self.draft[name] + step) * 2) / 2))
+        elif key == "ENTER":
+            values = dict(self.draft)
+
+            def done(_):
+                self.mode = "main"
+                self.message = (st.g("ok") + " " + st.t("时段已保存 · 下次检查时生效"), "ok")
+
+            self.perform(st.t("正在保存时段…"), lambda: self.backend.set_durations(values), done, "保存时段")
+        return True
+
+    def run_doctor(self):
+        def done(result):
+            self.doctor_result, self.mode, self.message = result, "doctor", None
+
+        self.perform(self.st.t("正在自检…"), self.backend.doctor, done, "自检", refresh=False)
+
+    def _key_doctor(self, key):
+        if key in ("q", "Q"):
+            return False
+        if key in ("r", "R"):
+            self.run_doctor()
+        elif key in ("ESC", "ENTER", "BACKSPACE", "d", "D"):
+            self.mode = "main"
+        return True
+
+    def _key_help(self, key):
+        if key in ("q", "Q"):
+            return False
+        if key in ("ESC", "ENTER", "?", "BACKSPACE"):
+            self.mode = "main"
+        return True
+
+    # -- rendering ------------------------------------------------------------
+    def render(self, width, height, now=None):
+        now = now or self.clock()
+        st = self.st
+        if width < MIN_WIDTH or height < MIN_HEIGHT:
+            self.editor_visible = False
+            return self.render_too_small(width, height)
+        self.editor_visible = True
+        inner = width - 1  # curses cannot safely write the last column
+        footer = [self.message_line(inner, now), [(" ", ""), (st.g("rule") * (inner - 1), "dim")],
+                  self.keys_line(inner)]
+        if self.mode == "doctor":
+            parts, body = [(st.t("自检"), "")], doctor_body(st, self.doctor_result or {}, inner)
+        elif self.mode == "help":
+            parts, body = [(st.t("帮助"), "")], self.help_body(inner)
+        else:
+            parts = series_title(self.cfg) if self.cfg else []
+            body = self.main_body(inner, now, height - 2 - len(footer))
+        top = header_lines(st, parts, inner, inner - 1, right=now.strftime("%H:%M:%S"))
+        if len(body) + len(top) + 2 + len(footer) <= height:
+            top = [[]] + top + [[]]  # breathing room above and below the title when it fits
+        room = height - len(top) - len(footer)
+        if len(body) > room:
+            body = body[:room - 1] + [[(" " * INDENT, ""), (
+                st.g("ellipsis") + " " + st.t("窗口高度不足，部分内容未显示"), "dim")]]
+        body = body + [[] for _ in range(room - len(body))]
+        return [clip_line(line, inner, st.g("ellipsis")) for line in top + body + footer]
+
+    def render_too_small(self, width, height):
+        st = self.st
+        texts = [(st.t("终端窗口太小"), "strong"),
+                 (st.t("当前 {w}{x}{h}，至少需要 {mw}{x}{mh}", w=width, h=height, mw=MIN_WIDTH,
+                       mh=MIN_HEIGHT, x=st.g("times")), "dim"),
+                 (st.t("按 Esc 取消编辑" if self.mode in ("location", "durations") else "按 Q 退出"), "dim")]
+        lines = [[] for _ in range(max(0, height))]
+        top = max(0, (height - len(texts)) // 2)
+        for offset, (text, style) in enumerate(texts):
+            if top + offset < height:
+                text = clip(text, max(0, width - 1))
+                left = max(0, (width - 1 - dwidth(text)) // 2)
+                lines[top + offset] = [(" " * left, ""), (text, style)]
+        return lines
+
+    def main_body(self, width, now, room=None):
+        """Main page body.  While editing, blocks are dropped (least useful
+        first) until the editor fits in ``room`` lines, so the focused field
+        is never pushed off screen."""
+        st = self.st
+        if self.cfg is None:
+            return warning_lines(st, self.load_errors, width, "err")
+        editing = self.mode in ("location", "durations")
+        cfg = dict(self.cfg, **self.draft) if self.mode == "durations" else self.cfg
+        blocks = [("timeline", timeline_lines(st, self.schedule(now, cfg), now, width,
+                                              bar_width_for(width, 72)) + [[]])]
+        if self.snap:
+            blocks.append(("now", now_next_rows(st, self.snap, self.cfg, now, width, precise=True) + [[]]))
+            blocks.append(("videos", video_rows(st, video_states(self.snap), width, self.snap.get("pinnedBytes"))))
+            blocks.append(("agent", agent_rows(st, self.snap.get("launchAgentLoaded"), width)))
+        blocks.append(("location", self.location_rows(width)))
+        blocks.append(("durations", self.duration_rows(width)))
+        if not editing:
+            blocks.append(("series", [[]] + self.series_rows(width)))
+        warnings = self.load_errors + status_warnings(st, self.snap)
+        if warnings:
+            blocks.append(("warnings", [[]] + warning_lines(st, warnings, width,
+                                                            "err" if self.load_errors else "warn")))
+        if editing and room is not None:
+            other = "durations" if self.mode == "location" else "location"
+            # The durations editor keeps the timeline longest: it previews the edit.
+            order = ["warnings", "agent", "videos", "now", other, "timeline"]
+            if self.mode == "location":
+                order = ["warnings", "agent", "videos", "timeline", "now", other]
+            for name in order:
+                if sum(len(lines) for _, lines in blocks) <= room:
+                    break
+                blocks = [(key, lines) for key, lines in blocks if key != name]
+            self.editor_visible = sum(len(lines) for _, lines in blocks) <= room
+        return [line for _, lines in blocks for line in lines]
+
+    def editor_rows(self, label, rows, width):
+        st = self.st
+        column = INDENT + st.lw
+        lines = []
+        for index, (active, spans) in enumerate(rows):
+            head = label_prefix(st, label, "accent") if index == 0 else [(" " * column, "")]
+            pointer = (st.g("pointer") + " ", "accent") if active else ("  ", "")
+            lines.append(clip_line(head + [pointer] + spans, width, st.g("ellipsis")))
+        return lines
+
+    def location_rows(self, width):
+        st = self.st
+        if self.mode != "location":
+            return text_rows(st, "位置", coords_text(st, self.cfg), width)
+        rows = []
+        for index, (name, label, hint) in enumerate(LOCATION_FIELDS):
+            active = index == self.field
+            size = 14
+            if name == "city":  # narrow windows: shrink the box so its hint still fits
+                size = max(14, min(22, width - INDENT - st.lw - 2 - 6 - 2 - dwidth(st.t(hint))))
+            value = self.fields.get(name, "") + (st.g("caret") if active else "")
+            while dwidth(value) > size - 1:
+                value = value[1:]
+            rows.append((active, [(pad(st.t(label), 6), "strong" if active else "label"),
+                                  (pad(" " + value, size), "field_active" if active else "field"),
+                                  ("  " + st.t(hint), "dim")]))
+        return self.editor_rows("位置", rows, width)
+
+    def duration_rows(self, width):
+        st = self.st
+        if self.mode != "durations":
+            return text_rows(st, "时段", durations_text(st, self.cfg), width)
+        rows = []
+        for index, (name, label, hint) in enumerate(DURATION_FIELDS):
+            active = index == self.draft_row
+            value = st.t("{v} 小时", v=f"{self.draft[name]:.1f}")
+            shown = (f"{st.g('left')} {value} {st.g('right')}" if active else f"  {value}  ")
+            rows.append((active, [(pad(st.t(label), 10), "strong" if active else "label"),
+                                  (shown, "accent" if active else ""), ("   " + st.t(hint), "dim")]))
+        return self.editor_rows("时段", rows, width)
+
+    def series_rows(self, width):
+        st = self.st
+        chunks = []
+        current = self.cfg.get("series") if self.cfg else None
+        for index, key in enumerate(SERIES_ORDER):
+            selected = index == self.cursor
+            chunks.append([(st.g("pointer") if selected else " ", "accent"),
+                           (" " + SERIES[key]["name"] + " ", "sel" if selected else ""),
+                           ((st.g("ok") if key == current else " "), "ok")])
+        rows = flow(label_prefix(st, "系列"), chunks, width, INDENT + st.lw, sep="   ",
+                    ellipsis=st.g("ellipsis"))
+        hint = self.series_hint()
+        if hint:
+            rows += text_rows(st, "", hint, width, "dim")
+        return rows
+
+    def series_hint(self):
+        st = self.st
+        key = SERIES_ORDER[self.cursor]
+        name = SERIES[key]["name"]
+        info = self.catalog.get(key) or {}
+        missing, pending = info.get("missing") or [], info.get("notDownloaded") or []
+        if missing:
+            return st.t("{name} 在素材清单中缺少 {n} 个视频，无法选择", name=name, n=len(missing))
+        if self.cfg and key == self.cfg.get("series"):
+            text = st.t("当前系列")
+        else:
+            text = st.t("Enter 切换到 {name}", name=name)
+        if not info:
+            return text
+        if pending:
+            return text + st.t(" · {n} 个视频待下载" if key == (self.cfg or {}).get("series")
+                               else " · {n} 个视频待下载，应用时自动下载", n=len(pending))
+        return text + st.t(" · 视频均已就绪")
+
+    def busy_line(self, width, now):
+        st = self.st
+        task = self.task
+        seconds = max(0, int((now - task["started"]).total_seconds()))
+        frames = st.g("spinner")
+        spin = frames[int((now - task["started"]).total_seconds() * 4) % len(frames)]
+        if self.exit_waiting:
+            text, style = st.t("正在写入壁纸设置，完成后自动退出…"), "warn"
+        elif self.quit_armed:
+            text, style = st.t("{name}进行中 · 再按一次 Q 强制退出（下载下次续传）",
+                               name=st.t(task["name"])), "warn"
+        elif self.busy_note and now < self.busy_note[1]:
+            text, style = self.busy_note[0], "warn"
+        else:
+            text, style = task["label"], "accent"
+        elapsed = "  " + st.t("{s} 秒", s=seconds)
+        # Clip the text, not the timer, so narrow windows still show progress.
+        text = clip(text, max(1, width - INDENT - 2 - dwidth(elapsed)), st.g("ellipsis"))
+        return clip_line([(" " * INDENT, ""), (spin + " ", "accent"), (text, style), (elapsed, "dim")],
+                         width, st.g("ellipsis"))
+
+    def message_line(self, width, now=None):
+        st = self.st
+        if self.task is not None:
+            return self.busy_line(width, now or self.clock())
+        if self.mode == "confirm" and self.snap:
+            series = SERIES.get(self.snap.get("series"), {})
+            period = self.snap.get("period")
+            prompt = st.t("立即应用 {p} · {name}？", p=st.t(PERIOD_NAMES.get(period, "")),
+                          name=series.get(period, ("", ""))[1])
+            return clip_line([(" " * INDENT, ""), (prompt, "strong"), ("   " + st.t("Y 确认   N 取消"), "dim")],
+                             width, st.g("ellipsis"))
+        if not self.message:
+            return []
+        text, style = self.message
+        return clip_line([(" " * INDENT, ""), (text, style)], width, st.g("ellipsis"))
+
+    def keys_line(self, width):
+        st = self.st
+        line, used = [(" " * INDENT, "")], INDENT
+        keys = FOOTER_KEYS[self.mode]
+        if self.task is not None:  # only browsing works while a write runs
+            keys = FOOTER_KEYS["busy"] if self.mode in ("main", "help") else (("Q", "退出"),)
+        for index, (key, text) in enumerate(keys):
+            key = st.g(key) if key in ("lr", "ud") else key
+            item = ([("   ", "")] if index else []) + [(key, "key"), (" " + st.t(text), "dim")]
+            if used + line_width(item) > width:
+                break
+            line += item
+            used += line_width(item)
+        return line
+
+    def help_body(self, width):
+        st = self.st
+        body = [[(" " * INDENT, ""), (st.t("按键"), "label")]]
+        for key, text in HELP_KEYS:
+            key = key.replace("lr", st.g("lr"))
+            body += flow([(" " * INDENT, ""), (pad(key, 12), "key")], [[(st.t(text), "")]], width,
+                         INDENT + 12, ellipsis=st.g("ellipsis"))
+        body += [[], [(" " * INDENT, ""), (st.t("说明"), "label")]]
+        for note in HELP_NOTES:
+            body += [[(" " * INDENT, ""), (part, "dim")] for part in wrap_text(st.t(note), width - INDENT)]
+        return body
+
+
+def curses_attributes(curses, st):
+    flags = {"bold": curses.A_BOLD, "dim": curses.A_DIM, "reverse": curses.A_REVERSE,
+             "underline": curses.A_UNDERLINE}
+    use_color = st.color and curses.has_colors()
+    palette, background = 8, -1
+    if use_color:
+        curses.start_color()
+        try:
+            curses.use_default_colors()
+        except curses.error:
+            background = curses.COLOR_BLACK
+        palette = 256 if curses.COLORS >= 256 else 8
+    attrs, pair = {}, 0
+    for name in sorted(set(ATTRS) | set(COLORS)):
+        attr, value = ATTRS.get(name), 0
+        index = COLORS[name][0 if palette == 256 else 1] if use_color and name in COLORS else None
+        if index is not None:
+            pair += 1
+            try:
+                curses.init_pair(pair, index, background)
+                value |= curses.color_pair(pair)
+                if attr == "dim" and palette == 256:
+                    attr = None
+            except curses.error:
+                pass
+        if attr:
+            value |= flags[attr]
+        attrs[name] = value
+    return attrs
+
+
+def curses_keymap(curses):
+    keymap = {curses.KEY_LEFT: "LEFT", curses.KEY_RIGHT: "RIGHT", curses.KEY_UP: "UP",
+              curses.KEY_DOWN: "DOWN", curses.KEY_ENTER: "ENTER", curses.KEY_BACKSPACE: "BACKSPACE",
+              curses.KEY_DC: "BACKSPACE", curses.KEY_BTAB: "BTAB", curses.KEY_RESIZE: "RESIZE"}
+    keymap.update({"\n": "ENTER", "\r": "ENTER", "\t": "TAB", "\x1b": "ESC", "\x7f": "BACKSPACE",
+                   "\b": "BACKSPACE", "\x15": "CLEAR", 10: "ENTER", 13: "ENTER", 9: "TAB", 27: "ESC",
+                   127: "BACKSPACE", 8: "BACKSPACE", 21: "CLEAR"})
+    return keymap
+
+
+KEY_NAMES = {"LEFT", "RIGHT", "UP", "DOWN", "ENTER", "BACKSPACE", "BTAB", "RESIZE", "TAB",
+             "ESC", "CLEAR"}
+ESCAPE_SEQUENCES = {"[A": "UP", "[B": "DOWN", "[C": "RIGHT", "[D": "LEFT", "OA": "UP",
+                    "OB": "DOWN", "OC": "RIGHT", "OD": "LEFT", "[Z": "BTAB", "OM": "ENTER",
+                    "[3~": "BACKSPACE"}
+
+
+def decode_escape(rest):
+    """Map the characters after a lone ESC; unknown sequences are ignored, not Esc."""
+    if not rest:
+        return "ESC"
+    return ESCAPE_SEQUENCES.get(rest)
+
+
+def translate_key(raw, keymap):
+    if raw is None:
+        return None
+    if raw in KEY_NAMES:
+        return raw
+    if raw in keymap:
+        return keymap[raw]
+    if isinstance(raw, str) and len(raw) == 1 and raw.isprintable():
+        return raw
+    return None
+
+
+def paint(screen, lines, attrs, ellipsis="…"):
+    screen.erase()
+    height, width = screen.getmaxyx()
+    for y, line in enumerate(lines[:height]):
+        x = 0
+        for text, style in clip_line(line, max(0, width - 1), ellipsis):
+            if text:
+                try:
+                    screen.addstr(y, x, text, attrs.get(style, 0))
+                except Exception:  # curses.error at the screen edge; keep drawing
+                    pass
+                x += dwidth(text)
+    screen.refresh()
+
+
+def tui_loop(screen, app, attrs, read_key, keymap, clock=None, guard=None):
+    """Paint, read one key (read_key waits at most ~0.2 s) and repeat.
+
+    Writes run on a daemon thread (app.background), so the clock, spinner,
+    resizing and keys keep working during slow downloads.  Quitting while a
+    write runs needs a second Q; the loop then takes ``guard`` (WRITE_GUARD)
+    and keeps it, so the process exits outside any plist/JSON/pin write step
+    and the worker cannot begin another.  An interrupted download leaves its
+    .part file, which the next run resumes.
+    """
+    clock = clock or app.clock
+    guard = WRITE_GUARD if guard is None else guard
+    ellipsis = app.st.g("ellipsis")
+    app.background = True
+    last = None
+    while True:
+        finished = app.poll()
+        if app.exit_waiting and (finished or guard.acquire(blocking=False)):
+            return
+        now = clock()
+        if app.needs_reload(now):
+            app.reload()
+        height, width = screen.getmaxyx()
+        frame = app.render(width, height, now)
+        if frame != last:
+            paint(screen, frame, attrs, ellipsis)
+            last = frame
+        key = translate_key(read_key(), keymap)
+        if key == "RESIZE":
+            screen.clear()
+            last = None
+            continue
+        if key is not None and not app.handle_key(key):
+            if app.task is None or guard.acquire(blocking=False):
+                return
+            app.exit_waiting = True  # a write step is in progress; leave right after it
+
+
+def run_tui(paths, backend=None):
+    import curses
+    import locale
+    try:
+        locale.setlocale(locale.LC_ALL, "")
+    except locale.Error:
+        pass
+    os.environ.setdefault("ESCDELAY", "25")
+    st = Style.for_encoding(locale.getpreferredencoding(False), tty=True)
+    backend = backend or LocalBackend(paths)
+
+    def session(screen):
+        try:
+            curses.curs_set(0)
+        except curses.error:
+            pass
+        if hasattr(curses, "set_escdelay"):
+            curses.set_escdelay(25)
+        screen.keypad(True)
+        screen.timeout(200)
+        attrs = curses_attributes(curses, st)
+        paint(screen, [[], [(" ", ""), ("Aerial Switch", "title"),
+                            (" " + st.g("dot") + " " + st.t("正在读取状态…"), "dim")]], attrs)
+        app = Dashboard(backend, st)
+
+        def read_key():
+            try:
+                raw = screen.get_wch()
+            except curses.error:
+                return None
+            if raw not in ("\x1b", 27):
+                return raw
+            # ncurses returns a lone ESC for sequences it does not know (for
+            # example ESC [ C when the terminal ignores application mode).
+            rest = ""
+            screen.nodelay(True)
+            try:
+                while len(rest) < 6:
+                    try:
+                        char = screen.get_wch()
+                    except curses.error:
+                        break
+                    if not isinstance(char, str):
+                        break
+                    rest += char
+                    if len(rest) > 1 and (char.isalpha() or char == "~"):
+                        break
+            finally:
+                screen.timeout(200)
+            return decode_escape(rest)
+
+        tui_loop(screen, app, attrs, read_key, curses_keymap(curses))
+
+    try:
+        curses.wrapper(session)  # restores the terminal on exit and on exceptions
+    except KeyboardInterrupt:
+        wait_for_write_guard()
+    return 0
+
+
+def wait_for_write_guard(guard=None, notify=None):
+    """After Ctrl-C, never exit while a write/verify/rollback step holds the guard.
+
+    The daemon worker dies with the process, so keep waiting (repeated Ctrl-C
+    included) until the critical section has finished.
+    """
+    guard = WRITE_GUARD if guard is None else guard
+    notify = notify or (lambda message: print(message, file=sys.stderr, flush=True))
+    warned = False
+    while True:
+        try:
+            if guard.acquire(timeout=30):
+                guard.release()
+                return
+        except KeyboardInterrupt:
+            pass
+        if not warned:
+            notify("正在完成壁纸设置的写入，完成后自动退出…")
+            warned = True
+
+
+def build_parser():
+    parser = argparse.ArgumentParser(
+        description="Switch Apple aerial wallpapers by local solar time",
+        epilog="Run without a command in a terminal to open the interactive dashboard. "
+               "Output is human-readable on a terminal and JSON otherwise or with --json.")
+    parser.add_argument("--json", action="store_true", help="Print JSON even on a terminal")
+    common = argparse.ArgumentParser(add_help=False)
+    common.add_argument("--json", action="store_true", default=argparse.SUPPRESS,
+                        help="Print JSON even on a terminal")
+    subs = parser.add_subparsers(dest="command")
+    subs.add_parser("status", parents=[common])
+    apply_parser = subs.add_parser("apply", parents=[common])
+    apply_parser.add_argument("--dry-run", action="store_true")
+    apply_parser.add_argument("--strict", action="store_true", help="Compatibility no-op; apply always requires the current video")
+    series_parser = subs.add_parser("series", parents=[common])
+    series_parser.add_argument("name", nargs="?", choices=tuple(SERIES))
+    series_parser.add_argument("--force", action="store_true", help="Compatibility option; missing videos are always allowed")
+    location_parser = subs.add_parser("location", parents=[common])
+    location_parser.add_argument("lat", type=float)
+    location_parser.add_argument("lon", type=float)
+    location_parser.add_argument("--city", default="")
+    install_parser = subs.add_parser("install", parents=[common])
+    install_parser.add_argument("--prefix", help="Installation prefix (executable goes in PREFIX/bin)")
+    install_parser.add_argument("--migrate", action="store_true", help="Stop legacy LaunchAgents and move their plists to legacy-backup")
+    uninstall_parser = subs.add_parser("uninstall", parents=[common])
+    uninstall_parser.add_argument("--restore", action="store_true")
+    subs.add_parser("doctor", parents=[common])
+    return parser
+
+
+def current_series(paths):
+    try:
+        return load_config(paths)["series"]
+    except Exception:
+        return None
+
+
+def is_tty(stream):
+    try:
+        return stream.isatty()
+    except (AttributeError, ValueError):
+        return False
+
+
+def main(argv=None):
+    parser = build_parser()
+    args = parser.parse_args(argv)
+    paths = Paths()
+    if args.command is None:
+        if not args.json and is_tty(sys.stdin) and is_tty(sys.stdout):
+            return run_tui(paths)
+        parser.print_help()
+        return 2
+    human = not args.json and is_tty(sys.stdout)
+    try:
+        if args.command == "doctor":
+            result = doctor(paths)
+            if human:
+                show(lambda st, width, now: doctor_lines(st, result, width))
+            else:
+                print(json.dumps(result, ensure_ascii=False, indent=2))
+            return int(any(not check["ok"] for check in result.values()))
+        if args.command == "uninstall":
+            result = uninstall(paths, args.restore)
+            view = lambda st, width, now: uninstall_lines(st, result, width)
+        elif args.command == "install":
+            result = install(paths, args.prefix, args.migrate)
+            view = lambda st, width, now: install_lines(st, result, width, paths)
+        elif args.command == "series" and not args.name:
+            result = {key: series_payload(str(paths.manifest), key, str(paths.videos)) for key in SERIES}
+            view = lambda st, width, now: series_list_lines(st, result, current_series(paths), width,
+                                                            series_videos(paths, result))
+        elif args.command == "series":
+            result = save_series(paths, args.name)
+            view = lambda st, width, now: series_saved_lines(st, result, width)
+        elif args.command == "location":
+            result = save_location(paths, args.lat, args.lon, args.city)
+            view = lambda st, width, now: location_saved_lines(st, result, now, width)
+        elif args.command == "apply":
+            cfg, result = apply_command(paths, args.dry_run)
+            view = lambda st, width, now: apply_lines(st, after_apply(paths, cfg, result, args.dry_run),
+                                                      cfg, now, width, args.dry_run)
+        else:
+            cfg = load_config(paths)
+            result = snapshot(paths, cfg)
+            view = lambda st, width, now: status_lines(st, result, cfg, now, width)
+        if human:
+            show(view)
+        else:
+            print(json.dumps(result, ensure_ascii=False, indent=2))
+        return 0
+    except (OSError, ValueError, RuntimeError, subprocess.SubprocessError, plistlib.InvalidFileException) as error:
+        print(f"ERROR: {error}", file=sys.stderr)
+        return 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())

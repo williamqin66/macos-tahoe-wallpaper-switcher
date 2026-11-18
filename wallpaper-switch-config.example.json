@@ -1,5 +1,6 @@
 {
-  "city": "Example City",
+  "series": "tahoe",
+  "city": "San Francisco",
   "lat": 37.7749,
   "lon": -122.4194,
   "morningHoursAfterSunrise": 2.5,
